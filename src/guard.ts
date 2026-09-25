@@ -137,6 +137,22 @@ export class Guard {
     return new Set([...this.platform.allSelfIds(), ...normalizeIdList(this.config.whitelist)])
   }
 
+  /**
+   * 事件游标和受管群列表是「某一个 AA」的数据：换了 AA 网址（例如从测试 AA 换到正式 AA）后要重新开始，
+   * 否则会拿测试 AA 的游标去读正式 AA，漏掉一批变化。
+   */
+  get cursorKey(): string {
+    return `cursor:${this.aaIdentity()}`
+  }
+
+  get groupsKey(): string {
+    return `groups:${this.aaIdentity()}`
+  }
+
+  private aaIdentity(): string {
+    return this.aa.endpoint('events').origin + this.aa.endpoint('events').pathname.replace(/qqbot\/api\/v1\/events\/$/, '')
+  }
+
   bindUrl(): string {
     const url = this.config.bindUrl?.trim()
     if (url) return url
@@ -211,7 +227,7 @@ export class Guard {
 
   async start() {
     this.paused = (await this.store.getKv<boolean>('paused')) ?? false
-    const saved = await this.store.getKv<ManagedGroup[]>('groups')
+    const saved = await this.store.getKv<ManagedGroup[]>(this.groupsKey)
     if (Array.isArray(saved) && saved.length) {
       this.groups = saved
       this.groupsLoaded = true
@@ -361,7 +377,7 @@ export class Guard {
     const before = new Set(this.groups.map((g) => g.groupId))
     this.groups = result.groups
     this.groupsLoaded = true
-    await this.store.setKv('groups', this.groups)
+    await this.store.setKv(this.groupsKey, this.groups)
     const now = new Set(this.groups.map((g) => g.groupId))
     for (const groupId of this.rosters.keys()) {
       if (!now.has(groupId)) this.rosters.delete(groupId)
@@ -963,7 +979,7 @@ export class Guard {
     if (this.eventsBusy || this.paused || this.patrolRunning) return
     this.eventsBusy = true
     try {
-      const cursor = await this.store.getKv<number>('cursor')
+      const cursor = await this.store.getKv<number>(this.cursorKey)
       if (typeof cursor !== 'number') {
         await this.initCursor()
         return
@@ -994,7 +1010,7 @@ export class Guard {
         const ok = await this.recheck([...qqs])
         if (!ok) return // 先处理、后保存：没处理完就不前进，下次重来
       }
-      if (last !== cursor) await this.store.setKv('cursor', last)
+      if (last !== cursor) await this.store.setKv(this.cursorKey, last)
     } finally {
       this.eventsBusy = false
     }
@@ -1012,7 +1028,7 @@ export class Guard {
       last = result.lastId
       if (!result.hasMore) break
     }
-    await this.store.setKv('cursor', last)
+    await this.store.setKv(this.cursorKey, last)
     this.requestPatrol()
   }
 
