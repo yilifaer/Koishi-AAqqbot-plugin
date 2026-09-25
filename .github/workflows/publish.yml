@@ -1,0 +1,43 @@
+# 发布到 npm。在 GitHub 网页上：Actions → Publish to npm → Run workflow。
+# 发布的版本号取自 package.json 的 version；这个版本已经发布过时会失败（npm 不允许重复发布）。
+#
+# 需要事先在仓库 Settings → Secrets and variables → Actions 里添加 NPM_TOKEN
+# （npmjs.com 上生成的、有发布权限的 Access Token）。
+name: Publish to npm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: 检查版本号还没发布过
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "koishi-plugin-aaqqbot@$VERSION" version >/dev/null 2>&1; then
+            echo "::error::版本 $VERSION 已经发布过了，请先修改 package.json 里的 version"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: 打上版本标签
+        run: |
+          git tag "v$VERSION"
+          git push origin "v$VERSION"

@@ -1,0 +1,63 @@
+{
+  "name": "koishi-plugin-aaqqbot",
+  "version": "0.1.0",
+  "description": "配合 AllianceAuth 插件 aa-qqbot，用 QQ 机器人管理联盟 QQ 群成员：审批入群、定时巡检、提醒与移出、同步群名片",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yilifaer/Koishi-AAqqbot-plugin.git"
+  },
+  "homepage": "https://github.com/yilifaer/Koishi-AAqqbot-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/yilifaer/Koishi-AAqqbot-plugin/issues"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "qq",
+    "onebot",
+    "allianceauth",
+    "eve-online"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "koishi": {
+    "description": {
+      "zh": "配合 AllianceAuth 插件 aa-qqbot 管理联盟 QQ 群：审批入群、巡检、提醒、移出、同步群名片",
+      "en": "Guard QQ groups with AllianceAuth (aa-qqbot): join approval, patrol, reminders, removal and card sync"
+    },
+    "service": {
+      "required": [
+        "database",
+        "http"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@koishijs/plugin-database-memory": "^3.7.0",
+    "@koishijs/plugin-http": "^0.6.3",
+    "@types/node": "^22.20.4",
+    "koishi": "^4.18.11",
+    "koishi-plugin-adapter-onebot": "^6.9.4",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
