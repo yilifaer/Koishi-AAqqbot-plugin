@@ -26,7 +26,7 @@ export class Notifier {
 
   /** 排队一条通知；几秒内的通知合并发送。 */
   push(text: string) {
-    this.logger.info(text.replace(/\n/g, ' | '))
+    this.logger.info('%s', text.replace(/\n/g, ' | '))
     if (!this.getAdminGroup()) return
     this.queue.push(text)
     if (!this.timer) this.timer = setTimeout(() => void this.flush(), FLUSH_DELAY_MS)
@@ -70,6 +70,7 @@ export class Notifier {
     try {
       this.sentAt.push(now)
       this.history.push(text)
+      if (this.history.length > 50) this.history.shift()
       await this.platform.sendGroup(bot, groupId, h.text(text))
     } catch (error) {
       this.logger.warn('运维通知发送失败：%s', error)

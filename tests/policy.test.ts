@@ -16,7 +16,7 @@ function verdict(qq: string, decision: Verdict['decision'], reason = decision ==
 }
 
 function tracked(qq: string, extra: Partial<TrackedMember> = {}): TrackedMember {
-  return { groupId: '123456789', qq, reason: 'NOT_BOUND', firstDeniedAt: new Date(NOW - 72 * HOUR), graceUntil: null, marked: true, lastRemindedAt: null, ...extra }
+  return { groupId: '123456789', qq, reason: 'NOT_BOUND', firstDeniedAt: new Date(NOW - 72 * HOUR), graceUntil: null, marked: true, lastRemindedAt: new Date(NOW - 10 * HOUR), ...extra }
 }
 
 /** 一个有 100 个合格成员的群，外加指定的人。 */
@@ -36,7 +36,8 @@ function input(mode: Mode, people: Array<[Member, Verdict]>, extra: Partial<Plan
     groupId: '123456789',
     mode,
     held: false,
-    bypassBreaker: false,
+    bypass: null,
+    kickApprovedBefore: 0,
     partial: false,
     groupSize: members.length,
     members,
@@ -46,7 +47,7 @@ function input(mode: Mode, people: Array<[Member, Verdict]>, extra: Partial<Plan
     botRole: 'admin',
     now: NOW,
     settings: {
-      graceMs: 48 * HOUR,
+      remindFreshMs: 36 * HOUR,
       breakerCount: 5,
       breakerPercent: 10,
       kickBudget: 10,
@@ -153,21 +154,33 @@ describe('remind 模式', () => {
 })
 
 describe('enforce 模式', () => {
-  it('新发现的不合格：截止时间 = 现在 + 宽限期，这一轮不移出', () => {
+  it('新发现的不合格：先不定截止时间（第一次成功提醒时才定），这一轮不移出', () => {
     const plan = planGroup(input('enforce', [[member('40001'), verdict('40001', 'deny')]]))
-    expect(plan.track[0].graceUntil?.getTime()).toBe(NOW + 48 * HOUR)
+    expect(plan.track[0].graceUntil).toBeNull()
     expect(plan.kicks).toEqual([])
   })
 
-  it('从 remind 升级来的（没有截止时间）：从现在开始算完整的宽限期', () => {
+  it('从 remind 升级来的（没有截止时间）：截止时间仍然等提醒时再定', () => {
     const data = input('enforce', [[member('40001'), verdict('40001', 'deny')]])
     data.tracked = new Map([['40001', tracked('40001', { graceUntil: null })]])
     const plan = planGroup(data)
-    expect(plan.track[0].graceUntil?.getTime()).toBe(NOW + 48 * HOUR)
+    expect(plan.track[0].graceUntil).toBeNull()
     expect(plan.kicks).toEqual([])
   })
 
-  it('宽限期到了且仍然 deny：移出', () => {
+  it('截止时间已到，但 36 小时内没有成功提醒过（例如熔断、暂停期间）：不移出', () => {
+    const data = input('enforce', [[member('40001'), verdict('40001', 'deny')]])
+    data.tracked = new Map([['40001', tracked('40001', { graceUntil: new Date(NOW - 1), lastRemindedAt: new Date(NOW - 72 * HOUR) })]])
+    expect(planGroup(data).kicks).toEqual([])
+  })
+
+  it('截止时间已到，但从没提醒过：不移出', () => {
+    const data = input('enforce', [[member('40001'), verdict('40001', 'deny')]])
+    data.tracked = new Map([['40001', tracked('40001', { graceUntil: new Date(NOW - 1), lastRemindedAt: null })]])
+    expect(planGroup(data).kicks).toEqual([])
+  })
+
+  it('宽限期到了、最近提醒过、仍然 deny：移出', () => {
     const data = input('enforce', [[member('40001', { card: '【SPY】张三' }), verdict('40001', 'deny')]])
     data.tracked = new Map([['40001', tracked('40001', { graceUntil: new Date(NOW - 1) })]])
     const plan = planGroup(data)
@@ -307,10 +320,55 @@ describe('熔断', () => {
     expect(plan.track).toEqual([])
   })
 
-  it('管理员确认后的一轮：不触发熔断', () => {
-    const plan = massDeny('remind', 20, { bypassBreaker: true })
+  it('管理员确认后的一轮：人数不超过确认时报告里的人数，不触发熔断', () => {
+    const plan = massDeny('remind', 20, { bypass: { maxNew: 20, maxKicks: 0 } })
     expect(plan.tripped).toBe(false)
     expect(plan.track).toHaveLength(20)
+  })
+
+  it('管理员确认后的一轮：人数比报告里多，照样熔断', () => {
+    const plan = massDeny('remind', 20, { bypass: { maxNew: 8, maxKicks: 0 } })
+    expect(plan.tripped).toBe(true)
+    expect(plan.track).toEqual([])
+  })
+
+  it('一次到期要移出的人太多：熔断，一个都不移出', () => {
+    const people: Array<[Member, Verdict]> = []
+    const rows = new Map<string, TrackedMember>()
+    for (let i = 0; i < 6; i++) {
+      const qq = String(40001 + i)
+      people.push([member(qq, { card: `【SPY】${qq}` }), verdict(qq, 'deny')])
+      rows.set(qq, tracked(qq, { graceUntil: new Date(NOW - 1) }))
+    }
+    const plan = planGroup(input('enforce', people, { tracked: rows }))
+    expect(plan.tripped).toBe(true)
+    expect(plan.tripReason).toContain('到期要移出')
+    expect(plan.kicks).toEqual([])
+    // 管理员确认过（确认时间晚于这些截止时间）：不再熔断，按每小时上限移出
+    const approved = planGroup(input('enforce', people, { tracked: rows, kickApprovedBefore: NOW }))
+    expect(approved.tripped).toBe(false)
+    expect(approved.kicks).toHaveLength(6)
+  })
+
+  it('熔断期间：合格了的人保留宽限记录，等能改动时再撤标记（避免标记残留）', () => {
+    const data = input('remind', [[member('40001', { card: '【SPY】张三' }), verdict('40001', 'allow', 'OK', '[IGC] 张三')]], { held: true })
+    data.tracked = new Map([['40001', tracked('40001')]])
+    const plan = planGroup(data)
+    expect(plan.untrack).toEqual([])
+    expect(plan.cards).toEqual([])
+  })
+
+  it('无法判断的人太多：这一轮不做任何改动', () => {
+    const people: Array<[Member, Verdict]> = []
+    for (let i = 0; i < 6; i++) {
+      const qq = String(40001 + i)
+      people.push([member(qq), verdict(qq, 'unknown', 'UNKNOWN')])
+    }
+    people.push([member('40100'), verdict('40100', 'deny')])
+    const plan = planGroup(input('remind', people))
+    expect(plan.unknownHeavy).toBe(true)
+    expect(plan.writes).toBe(false)
+    expect(plan.track).toEqual([])
   })
 
   it('已经在宽限期里的人不算「新增」，不会每轮都熔断', () => {
@@ -371,10 +429,25 @@ describe('名片同步', () => {
     expect(planGroup(data).cards).toEqual([])
   })
 
-  it('机器人是群主时，可以改管理员的名片', () => {
-    const data = input('remind', [], { botRole: 'owner' })
+  it('管理员、白名单的名片永远不改（即使机器人是群主）', () => {
+    const data = input('remind', [[member('99999', { card: 'x' }), verdict('99999', 'allow', 'OK', '[IGC] 白名单')]], { botRole: 'owner' })
     data.verdicts.set('20000', verdict('20000', 'allow', 'OK', '[IGC] 管理'))
-    expect(planGroup(data).cards.map((c) => c.qq)).toEqual(['20000'])
+    expect(planGroup(data).cards).toEqual([])
+  })
+
+  it('身份认不出来（unknown）的成员：按受保护处理', () => {
+    const data = input('enforce', [[member('40001', { role: 'unknown' }), verdict('40001', 'deny')]])
+    data.tracked = new Map([['40001', tracked('40001', { graceUntil: new Date(NOW - 1) })]])
+    const plan = planGroup(data)
+    expect(plan.kicks).toEqual([])
+    expect(plan.protectedDenies.map((d) => d.qq)).toEqual(['40001'])
+    // 已有的宽限记录取消
+    expect(plan.untrack).toEqual(['40001'])
+  })
+
+  it('机器人自己的身份认不出来：什么都不改', () => {
+    const plan = planGroup(input('remind', [[member('40001'), verdict('40001', 'deny')]], { botRole: 'unknown' }))
+    expect(plan.writes).toBe(false)
   })
 
   it('机器人不是管理员：什么都不改', () => {

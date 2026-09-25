@@ -104,6 +104,18 @@ export class AaClient {
 
   private async once(url: URL, bodyText: string, signal?: AbortSignal): Promise<ApiResult<{ data: any }>> {
     if (signal?.aborted) return failure('aborted', { hint: '已中止', retryable: false })
+    // HTTP 插件会在传入的 signal 上挂监听器且不移除；每次请求用一个临时的 signal，用完解绑，避免长期累积
+    const local = new AbortController()
+    const forward = () => local.abort()
+    signal?.addEventListener('abort', forward, { once: true })
+    try {
+      return await this.request(url, bodyText, local.signal, signal)
+    } finally {
+      signal?.removeEventListener('abort', forward)
+    }
+  }
+
+  private async request(url: URL, bodyText: string, requestSignal: AbortSignal, signal?: AbortSignal): Promise<ApiResult<{ data: any }>> {
     // 每次请求（包括重试）都重新生成时间戳、随机数和签名
     const headers = signedHeaders(this.options.keyId, this.options.secret, url.pathname, bodyText, this.now())
     let response: { status: number; data: unknown; headers: Headers }
@@ -116,7 +128,7 @@ export class AaClient {
         validateStatus: () => true, // 状态码由下面自己判断
         responseType: 'text', // 自己解析 JSON，不让 HTTP 库按 Content-Type 猜
         timeout: this.options.timeoutMs,
-        signal,
+        signal: requestSignal,
       }) as any
     } catch (error: any) {
       if (signal?.aborted || error instanceof AbortedError) return failure('aborted', { hint: '已中止', retryable: false })

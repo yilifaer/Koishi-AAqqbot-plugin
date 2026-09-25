@@ -38,6 +38,12 @@ async function settle() {
   await sleep(150)
 }
 
+/** 截止时间过去，并且在那之前刚又提醒过一次（每天都会提醒）。 */
+async function passDeadline() {
+  env.clock.now += 49 * HOUR
+  await env.guard.runReminders()
+}
+
 describe('巡检：report 模式', () => {
   it('提交完整名单（full_roster），发一条汇总，不改动群里任何东西', async () => {
     env = await setup()
@@ -94,8 +100,8 @@ describe('完整流程：remind → enforce → 移出', () => {
     // 不合格的人名片加标记，合格的人同步名片
     expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】张三')
     expect(env.qq.member(GROUP, '40002')!.card).toBe('[IGC] 李四')
-    const tracked = await env.guard.store.tracked(GROUP)
-    expect(tracked.get('40001')!.graceUntil!.getTime()).toBe(env.clock.now + 48 * HOUR)
+    // 截止时间要等第一次成功提醒时才定
+    expect((await env.guard.store.tracked(GROUP)).get('40001')!.graceUntil).toBeNull()
 
     // 每日提醒：@ 本人，带截止时间
     await env.guard.runReminders()
@@ -103,14 +109,19 @@ describe('完整流程：remind → enforce → 移出', () => {
     expect(reminder.ats).toEqual(['40001'])
     expect(reminder.text).toContain('截止')
     expect(reminder.text).toContain('https://auth.example.com/services/')
+    expect((await env.guard.store.tracked(GROUP)).get('40001')!.graceUntil!.getTime()).toBe(env.clock.now + 48 * HOUR)
 
-    // 47 小时后：还没到
-    env.clock.now += 47 * HOUR
+    // 第二天的提醒；47 小时后巡检：还没到
+    env.clock.now += 24 * HOUR
+    await env.guard.runReminders()
+    env.clock.now += 23 * HOUR
     await env.guard.runPatrol()
     expect(env.qq.member(GROUP, '40001')).toBeDefined()
 
-    // 49 小时后：移出，不拉黑
-    env.clock.now += 2 * HOUR
+    // 第三天的提醒；49 小时后巡检：移出，不拉黑
+    env.clock.now += 1 * HOUR
+    await env.guard.runReminders()
+    env.clock.now += 1 * HOUR
     await env.guard.runPatrol()
     expect(env.qq.member(GROUP, '40001')).toBeUndefined()
     const kick = env.qq.actions('set_group_kick')[0]
@@ -170,9 +181,11 @@ describe('完整流程：remind → enforce → 移出', () => {
     expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】名片40001')
     expect(env.qq.actions('set_group_kick')).toEqual([])
     expect((await env.adminMessages()).at(-1)).toContain('暂时按 remind 执行')
-    // 确认后才开始 enforce 的宽限期（从现在起 48 小时）
+    // 确认后，第一次带截止时间的提醒才开始 enforce 的宽限期（从那时起 48 小时）
     await env.guard.confirm(GROUP, OPERATOR)
     await env.guard.runPatrol([GROUP])
+    expect((await env.guard.store.tracked(GROUP)).get('40001')!.graceUntil).toBeNull()
+    await env.guard.runReminders()
     expect((await env.guard.store.tracked(GROUP)).get('40001')!.graceUntil!.getTime()).toBe(env.clock.now + 48 * HOUR)
   })
 
@@ -220,7 +233,8 @@ describe('永不处置的人', () => {
     addMembers('40001')
     await confirmMode('enforce')
     await env.guard.runPatrol([GROUP])
-    env.clock.now += 49 * HOUR
+    await env.guard.runReminders()
+    await passDeadline()
     // 巡检拿到的名单里还是普通成员，但实时查询时已经是管理员
     const original = env.qq.handle.bind(env.qq)
     env.qq.handle = (action, params) => {
@@ -261,7 +275,8 @@ describe('AA 出问题时绝不处置', () => {
       addMembers('40001')
       await confirmMode('enforce')
       await env.guard.runPatrol([GROUP])
-      env.clock.now += 49 * HOUR
+      await env.guard.runReminders()
+      await passDeadline()
       env.aa.override('check', response)
       await env.guard.runPatrol()
       expect(env.qq.actions('set_group_kick')).toEqual([])
@@ -573,7 +588,8 @@ describe('暂停与中止', () => {
     addMembers('40001')
     await confirmMode('enforce')
     await env.guard.runPatrol([GROUP])
-    env.clock.now += 49 * HOUR
+    await env.guard.runReminders()
+    await passDeadline()
     env.aa.override('check', { status: 200, body: '{}', delayMs: 1000 })
     const patrol = env.guard.runPatrol()
     await sleep(100)
@@ -629,8 +645,9 @@ describe('通知', () => {
     addMembers('40001')
     await confirmMode('enforce')
     await env.guard.runPatrol([GROUP])
-    env.clock.now += 49 * HOUR
-    env.qq.failSend = true
+    await env.guard.runReminders()
+    await passDeadline()
+    env.qq.failSendGroups.add(ADMIN_GROUP)
     await env.guard.runPatrol()
     await env.adminMessages()
     expect(env.qq.member(GROUP, '40001')).toBeUndefined()
@@ -718,5 +735,172 @@ describe('管理命令鉴权', () => {
     setMode('enforce')
     await env.guard.runPatrol()
     expect((await env.say(OPERATOR, `aaqq.confirm ${GROUP}`)).join()).toContain('模式升级为 enforce')
+  })
+})
+
+describe('审查发现的问题（回归测试）', () => {
+  it('熔断 3 天期间没有提醒：确认后不会立刻移出，要重新提醒后才移出', async () => {
+    env = await setup()
+    const others = ['40002', '40003', '40004', '40005', '40006', '40007', '40008']
+    addMembers('40001', ...others)
+    for (const qq of others) env.aa.allow(qq, `[IGC] ${qq}`)
+    await confirmMode('enforce')
+    await env.guard.runPatrol([GROUP])
+    await env.guard.runReminders() // 40001 的截止时间定在 48 小时后
+    for (const qq of others) env.aa.deny(qq, 'NO_ACCESS')
+    await env.guard.runPatrol()
+    expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
+    env.clock.now += 72 * HOUR
+    await env.guard.runReminders() // 熔断中，不提醒
+    await env.guard.runPatrol()
+    expect(await env.guard.confirm(GROUP, OPERATOR)).toContain('解除熔断')
+    await env.guard.runPatrol([GROUP])
+    expect(env.qq.member(GROUP, '40001')).toBeDefined()
+    // 重新提醒之后，下一轮才移出
+    await env.guard.runReminders()
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, '40001')).toBeUndefined()
+  })
+
+  it('确认后那一轮巡检失败：豁免 1 小时后失效，之后 AA 再出问题照样熔断', async () => {
+    env = await setup()
+    const people = ['40001', '40002', '40003', '40004', '40005', '40006', '40007', '40008']
+    addMembers(...people)
+    for (const qq of people) env.aa.allow(qq, `[IGC] ${qq}`)
+    await confirmMode('remind')
+    await env.guard.runPatrol([GROUP])
+    for (const qq of people.slice(0, 3)) env.aa.deny(qq, 'NO_ACCESS')
+    await env.guard.runPatrol() // 3 人 > 阈值 1 → 熔断
+    expect(await env.guard.confirm(GROUP, OPERATOR)).toContain('不超过 3 人')
+    env.aa.override('check', { status: 500, body: '{}' }, 1)
+    await env.guard.runPatrol([GROUP]) // 失败
+    env.clock.now += 2 * HOUR
+    for (const qq of people) env.aa.deny(qq, 'NO_ACCESS') // AA 被改错：全员不合格
+    await env.guard.runPatrol()
+    expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
+    expect(env.qq.actions('set_group_card').filter((c) => String(c.params.card).startsWith('【SPY】'))).toEqual([])
+  })
+
+  it('确认后的豁免只覆盖报告里的人数：更多人变成不合格照样熔断', async () => {
+    env = await setup()
+    const people = ['40001', '40002', '40003', '40004', '40005', '40006', '40007', '40008']
+    addMembers(...people)
+    for (const qq of people) env.aa.allow(qq, `[IGC] ${qq}`)
+    await confirmMode('remind')
+    await env.guard.runPatrol([GROUP])
+    for (const qq of people.slice(0, 2)) env.aa.deny(qq)
+    await env.guard.runPatrol() // 2 人 → 熔断
+    await env.guard.confirm(GROUP, OPERATOR)
+    for (const qq of people) env.aa.deny(qq) // 确认之后又多了 6 人
+    await env.guard.runPatrol([GROUP])
+    expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
+    expect(env.qq.actions('set_group_card').filter((c) => String(c.params.card).startsWith('【SPY】'))).toEqual([])
+  })
+
+  it('移出前再问一次 AA：刚好在这时绑定好了 → 不移出', async () => {
+    env = await setup()
+    addMembers('40001')
+    await confirmMode('enforce')
+    await env.guard.runPatrol([GROUP])
+    await env.guard.runReminders()
+    await passDeadline()
+    env.aa.beforeResponse = (name, body) => {
+      if (name === 'check' && body.full_roster === false && body.qqs.includes('40001')) env.aa.allow('40001', '[IGC] 张三')
+    }
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, '40001')).toBeDefined()
+    expect((await env.adminMessages()).at(-1)).toContain('复核后跳过 1 人')
+  })
+
+  it('白名单里的人申请入群、AA 判不合格：不拒绝，留给管理员', async () => {
+    env = await setup({ whitelist: ['40001'] })
+    await confirmMode('enforce')
+    await requestEvent('40001', '')
+    await settle()
+    expect(env.qq.requests).toEqual([])
+    expect((await env.adminMessages()).at(-1)).toContain('白名单')
+  })
+
+  it('补处理的申请：合格的同意，不合格的不自动拒绝（可能是邀请入群）', async () => {
+    env = await setup()
+    await confirmMode('enforce')
+    env.aa.allow('40001', '[IGC] 甲')
+    env.qq.systemMsg = {
+      join_requests: [
+        { request_id: 801, requester_uin: 40001, message: '', group_id: +GROUP, checked: false },
+        { request_id: 802, requester_uin: 40002, message: '', group_id: +GROUP, checked: false },
+      ],
+    }
+    await env.guard.catchUpRequests(env.bot as any)
+    expect(env.qq.requests).toEqual([{ flag: '801', approve: true, reason: '' }])
+    expect((await env.adminMessages()).join('\n')).toContain('补处理的申请不自动拒绝')
+  })
+
+  it('补处理时，刚通过实时事件处理过的人不再重复处理', async () => {
+    env = await setup()
+    env.aa.allow('40001', '[IGC] 甲')
+    await requestEvent('40001', '')
+    await settle()
+    env.qq.systemMsg = { join_requests: [{ request_id: 803, requester_uin: 40001, message: '', group_id: +GROUP, checked: false }] }
+    await env.guard.catchUpRequests(env.bot as any)
+    expect(env.aa.count('claim')).toBe(1)
+  })
+
+  it('群改成 off：撤掉标记、清空宽限记录', async () => {
+    env = await setup()
+    addMembers('40001')
+    env.qq.member(GROUP, '40001')!.card = '张三'
+    await confirmMode('remind')
+    await env.guard.runPatrol([GROUP])
+    expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】张三')
+    setMode('off')
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, '40001')!.card).toBe('张三')
+    expect((await env.guard.store.tracked(GROUP)).size).toBe(0)
+  })
+
+  it('群从 AA 移除后再加回来：确认状态清空，要重新确认', async () => {
+    env = await setup()
+    await confirmMode('enforce')
+    const groups = env.aa.groups
+    env.aa.groups = []
+    await env.guard.refreshGroups()
+    env.aa.groups = groups
+    await env.guard.refreshGroups()
+    expect(await env.guard.statusText()).toContain('设为 enforce，等待确认')
+  })
+
+  it('身份认不出来的成员：不加标记', async () => {
+    env = await setup()
+    addMembers('40001')
+    ;(env.qq.member(GROUP, '40001') as any).role = 'weird'
+    await confirmMode('remind')
+    await env.guard.runPatrol([GROUP])
+    expect(env.qq.member(GROUP, '40001')!.card).toBe('名片40001')
+  })
+
+  it('事件复查遇到确定性错误（例如 403）：跳过，不卡住游标', async () => {
+    env = await setup()
+    addMembers('40001')
+    await env.guard.runPatrol()
+    await env.guard.store.setKv('cursor', 0)
+    env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }]
+    env.aa.override('check', { status: 403, body: '<html>Forbidden</html>' }, 1)
+    await env.guard.pollEvents()
+    expect(await env.guard.store.getKv('cursor')).toBe(1)
+  })
+
+  it('提醒没发出去：不定截止时间，也就不会被移出', async () => {
+    env = await setup()
+    addMembers('40001')
+    await confirmMode('enforce')
+    await env.guard.runPatrol([GROUP])
+    env.qq.failSendGroups.add(GROUP)
+    await env.guard.runReminders()
+    expect((await env.guard.store.tracked(GROUP)).get('40001')!.graceUntil).toBeNull()
+    env.clock.now += 100 * HOUR
+    await env.guard.runReminders()
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, '40001')).toBeDefined()
   })
 })
