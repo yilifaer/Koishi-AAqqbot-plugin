@@ -51,6 +51,8 @@ export class FakeAA {
   events: Array<{ id: number; kind: string; qq: string }> = []
   /** 接口名 → 下一次（或每次）返回的固定响应。 */
   overrides = new Map<string, Override & { times?: number }>()
+  /** 在 AA 回答之前调用（可以在这里改判定，模拟「刚好在这时绑定好了」）。 */
+  beforeResponse: ((name: string, body: any) => void) | null = null
   private nonces = new Set<string>()
 
   allow(qq: string, card: string) {
@@ -139,6 +141,7 @@ export class FakeAA {
     if (this.nonces.has(nonce)) return send(401, { ok: false, error: 'replayed_nonce' })
     this.nonces.add(nonce)
 
+    this.beforeResponse?.(name, body)
     const server_time = new Date().toISOString()
     switch (name) {
       case 'health':
@@ -210,6 +213,8 @@ export class FakeQQ {
   requests: Array<{ flag: string; approve: boolean; reason: string }> = []
   failKick = new Set<string>()
   failSend = false
+  /** 只让发往这些群的消息失败。 */
+  failSendGroups = new Set<string>()
   systemMsg: any = { join_requests: [], invited_requests: [] }
   private messageId = 0
 
@@ -260,8 +265,8 @@ export class FakeQQ {
         return ok()
       case 'send_group_msg':
       case 'send_private_msg': {
-        if (this.failSend) return fail(1200)
         const isGroup = action === 'send_group_msg'
+        if (this.failSend || (isGroup && this.failSendGroups.has(String(params.group_id)))) return fail(1200)
         this.sent.push({ kind: isGroup ? 'group' : 'private', target: String(isGroup ? params.group_id : params.user_id), ...flatten(params.message), raw: params.message })
         return ok({ message_id: ++this.messageId })
       }

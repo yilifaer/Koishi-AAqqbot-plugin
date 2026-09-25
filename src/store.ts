@@ -24,8 +24,15 @@ export interface GroupState {
   /** 熔断开始的时间；不为 null 表示这个群处于熔断状态。 */
   holdSince: Date | null
   holdNote: string
-  /** 管理员确认后，下一轮巡检不触发熔断。 */
-  bypassOnce: boolean
+  /** 管理员最近一次 aaqq.confirm 的时间。截止时间早于它的移出视为已确认。 */
+  lastConfirmAt: Date | null
+  /** 确认后的豁免：在这个时间之前的下一轮巡检，人数不超过下面两个数就不熔断。 */
+  bypassUntil: Date | null
+  bypassMaxNew: number
+  bypassMaxKicks: number
+  /** 最近一轮巡检的「新发现不合格」和「到期要移出」人数（确认时用作豁免上限）。 */
+  lastNewDenies: number
+  lastKicksDue: number
   lastPatrolAt: Date | null
   lastPatrolOk: boolean
   lastPatrolNote: string
@@ -73,7 +80,12 @@ export function extendModels(ctx: Context) {
     confirmedBy: { type: 'string', length: 64 },
     holdSince: { type: 'timestamp', nullable: true },
     holdNote: 'text',
-    bypassOnce: 'boolean',
+    lastConfirmAt: { type: 'timestamp', nullable: true },
+    bypassUntil: { type: 'timestamp', nullable: true },
+    bypassMaxNew: 'unsigned',
+    bypassMaxKicks: 'unsigned',
+    lastNewDenies: 'unsigned',
+    lastKicksDue: 'unsigned',
     lastPatrolAt: { type: 'timestamp', nullable: true },
     lastPatrolOk: 'boolean',
     lastPatrolNote: 'text',
@@ -103,7 +115,12 @@ export function defaultGroupState(groupId: string): GroupState {
     confirmedBy: '',
     holdSince: null,
     holdNote: '',
-    bypassOnce: false,
+    lastConfirmAt: null,
+    bypassUntil: null,
+    bypassMaxNew: 0,
+    bypassMaxKicks: 0,
+    lastNewDenies: 0,
+    lastKicksDue: 0,
     lastPatrolAt: null,
     lastPatrolOk: false,
     lastPatrolNote: '',
@@ -126,12 +143,21 @@ export class Store {
     if (rows.length) await this.db.upsert('aaqqbot_member', rows)
   }
 
+  /** 只更新还存在的记录（不会把刚被删除的人重新写回来）。 */
+  async markReminded(groupId: string, rows: Array<Pick<TrackedMember, 'qq' | 'graceUntil' | 'lastRemindedAt'>>) {
+    for (const row of rows) {
+      await this.db.set('aaqqbot_member', { groupId, qq: row.qq }, { graceUntil: row.graceUntil, lastRemindedAt: row.lastRemindedAt })
+    }
+  }
+
   async removeTracked(groupId: string, qqs: string[]) {
     if (qqs.length) await this.db.remove('aaqqbot_member', { groupId, qq: qqs })
   }
 
-  async removeGroupTracking(groupId: string) {
+  /** 群从 AA 上移除：宽限记录和确认状态都清掉，以后重新加回来要重新确认。 */
+  async forgetGroup(groupId: string) {
     await this.db.remove('aaqqbot_member', { groupId })
+    await this.db.remove('aaqqbot_group', { groupId })
   }
 
   async groupState(groupId: string): Promise<GroupState> {

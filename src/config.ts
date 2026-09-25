@@ -116,7 +116,7 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     graceHours: Schema.natural().min(1).max(720).default(48)
-      .description('enforce 模式下，发现不合格后给多少小时去补绑定，过了时间还不合格才移出。'),
+      .description('enforce 模式下的宽限期：从第一次收到带截止时间的 @ 提醒开始算，过了时间还不合格才移出。移出前 36 小时内一定成功提醒过这个人。'),
     remindTime: Schema.string().pattern(/^\s*([01]?\d|2[0-3]):[0-5]\d\s*$/).default('19:30')
       .description('每天几点在群里 @ 提醒不合格的人（机器人电脑的本地时间，格式 `19:30`）。'),
     remindTemplate: Schema.string().role('textarea').default('以下成员还没有满足本群的要求，请尽快在联盟 AA 完成 QQ 绑定：{url}\n{list}')

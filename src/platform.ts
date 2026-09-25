@@ -105,7 +105,8 @@ export class Platform {
 function toMember(item: any): Member | null {
   const qq = normalizeId(item?.user_id)
   if (!qq) return null
-  const role: Role = item.role === 'owner' || item.role === 'admin' ? item.role : 'member'
+  // 只有明确是 member 的才算普通成员；认不出来的按受保护处理（R7「角色判不出就跳过」）
+  const role: Role = item.role === 'owner' || item.role === 'admin' || item.role === 'member' ? item.role : 'unknown'
   return {
     qq,
     role,
