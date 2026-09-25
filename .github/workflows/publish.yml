@@ -1,8 +1,9 @@
 # 发布到 npm。在 GitHub 网页上：Actions → Publish to npm → Run workflow。
 # 发布的版本号取自 package.json 的 version；这个版本已经发布过时会失败（npm 不允许重复发布）。
 #
-# 需要事先在仓库 Settings → Secrets and variables → Actions 里添加 NPM_TOKEN
-# （npmjs.com 上生成的、有发布权限的 Access Token）。
+# 身份验证（二选一）：
+# - 受信任发布（推荐，不需要令牌）：在 npmjs.com 的包设置里把本仓库的 publish.yml 设为 Trusted Publisher。
+# - 令牌：在仓库 Settings → Secrets and variables → Actions 里添加 NPM_TOKEN。
 name: Publish to npm
 
 on:
@@ -34,6 +35,8 @@ jobs:
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: 升级 npm（受信任发布需要 npm 11.5.1 以上）
+        run: npm install -g npm@latest
       - run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
