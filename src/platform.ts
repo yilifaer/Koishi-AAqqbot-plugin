@@ -43,8 +43,18 @@ export class Platform {
     return { bot, problem: null }
   }
 
+  /**
+   * 取群成员名单，强制 LLBot 从 QQ 服务器刷新（no_cache）。
+   * adapter-onebot 的 getGroupMemberList 会丢掉 no_cache 参数（交接文档 03 #15），所以直接调用底层接口。
+   */
   async listMembers(bot: Bot, groupId: string): Promise<Member[]> {
-    const list = await bot.internal.getGroupMemberList(groupId)
+    const id = Number(groupId)
+    const response = await (bot.internal as any)._request('get_group_member_list', {
+      group_id: Math.abs(id) < 4294967296 ? id : groupId,
+      no_cache: true,
+    })
+    if (!response || response.retcode !== 0) throw new Error(`取群成员名单失败（retcode ${response?.retcode}）`)
+    const list = response.data
     if (!Array.isArray(list)) throw new Error('群成员列表格式不对')
     const members: Member[] = []
     for (const item of list) {

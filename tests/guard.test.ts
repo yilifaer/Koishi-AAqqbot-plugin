@@ -917,3 +917,65 @@ describe('审查发现的问题（回归测试）', () => {
     expect(env.qq.member(GROUP, '40001')).toBeDefined()
   })
 })
+
+describe('第二轮问题清单（回归测试）', () => {
+  it('取群成员名单时强制 LLBot 刷新（no_cache）', async () => {
+    env = await setup()
+    await env.guard.runPatrol()
+    const call = env.qq.actions('get_group_member_list')[0]
+    expect(call.params).toMatchObject({ group_id: +GROUP, no_cache: true })
+  })
+
+  it('名单突然变少：不当作完整名单交给 AA，也不取消跟踪；下一轮名单稳定后恢复', async () => {
+    env = await setup()
+    const people = Array.from({ length: 20 }, (_, i) => String(40001 + i))
+    addMembers(...people)
+    for (const qq of people.slice(1)) env.aa.allow(qq, `名片${qq}`)
+    await confirmMode('remind')
+    await env.guard.runPatrol([GROUP]) // 40001 被跟踪
+    expect((await env.guard.store.tracked(GROUP)).has('40001')).toBe(true)
+    // LLBot 只返回了一部分人（40001 不在里面）
+    const group = env.qq.groups.get(GROUP)!
+    for (const qq of people.slice(0, 12)) group.delete(qq)
+    await env.guard.runPatrol()
+    expect(env.aa.last('check')!.body.full_roster).toBe(false)
+    expect((await env.guard.store.tracked(GROUP)).has('40001')).toBe(true)
+    expect((await env.adminMessages()).at(-1)).toContain('可能不完整')
+    // 下一轮人数一样：按完整名单处理
+    await env.guard.runPatrol()
+    expect(env.aa.last('check')!.body.full_roster).toBe(true)
+    expect((await env.guard.store.tracked(GROUP)).has('40001')).toBe(false)
+  })
+
+  it('启动步骤出错：定时任务照样安排好', async () => {
+    env = await setup()
+    ;(env.guard as any).options.timers = true
+    env.guard.checkHealth = async () => { throw new Error('boom') }
+    env.guard.nextPatrolAt = null
+    await env.guard.start()
+    expect(env.guard.nextPatrolAt).not.toBeNull()
+  })
+
+  it('启动时读不到暂停状态：为安全起见先暂停', async () => {
+    env = await setup()
+    const original = env.guard.store.getKv.bind(env.guard.store)
+    env.guard.store.getKv = (async (key: string) => {
+      if (key === 'paused') throw new Error('db down')
+      return original(key)
+    }) as any
+    await env.guard.start()
+    expect(env.guard.paused).toBe(true)
+  })
+
+  it('一轮巡检时间到了：停在两个群之间，剩下的群马上接着巡检', async () => {
+    env = await setup()
+    env.aa.groups.push({ group_id: OTHER_GROUP, name: '旗舰群', kind: 'role' })
+    env.qq.addGroup(OTHER_GROUP, [{ user_id: +BOT, role: 'admin', card: '机器人', nickname: 'bot' }])
+    await env.guard.refreshGroups()
+    ;(env.guard as any).options.patrolSoftBudgetMs = 0
+    ;(env.guard as any).patrolQueue = null // 机器人上线时排的那次全量巡检不算
+    await env.guard.runPatrol()
+    expect([...(env.guard as any).patrolQueue]).toEqual([OTHER_GROUP])
+    expect((await env.adminMessages()).at(-1)).toContain('马上接着巡检')
+  })
+})

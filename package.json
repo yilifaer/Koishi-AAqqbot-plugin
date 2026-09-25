@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-aaqqbot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "配合 AllianceAuth 插件 aa-qqbot，用 QQ 机器人管理联盟 QQ 群成员：审批入群、定时巡检、提醒与移出、同步群名片",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

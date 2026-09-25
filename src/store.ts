@@ -33,6 +33,8 @@ export interface GroupState {
   /** 最近一轮巡检的「新发现不合格」和「到期要移出」人数（确认时用作豁免上限）。 */
   lastNewDenies: number
   lastKicksDue: number
+  /** 上一轮巡检取到的群人数（用来发现「名单突然变少」）。 */
+  lastRosterSize: number
   lastPatrolAt: Date | null
   lastPatrolOk: boolean
   lastPatrolNote: string
@@ -86,6 +88,7 @@ export function extendModels(ctx: Context) {
     bypassMaxKicks: 'unsigned',
     lastNewDenies: 'unsigned',
     lastKicksDue: 'unsigned',
+    lastRosterSize: 'unsigned',
     lastPatrolAt: { type: 'timestamp', nullable: true },
     lastPatrolOk: 'boolean',
     lastPatrolNote: 'text',
@@ -121,6 +124,7 @@ export function defaultGroupState(groupId: string): GroupState {
     bypassMaxKicks: 0,
     lastNewDenies: 0,
     lastKicksDue: 0,
+    lastRosterSize: 0,
     lastPatrolAt: null,
     lastPatrolOk: false,
     lastPatrolNote: '',
