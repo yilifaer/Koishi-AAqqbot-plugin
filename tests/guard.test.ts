@@ -602,6 +602,27 @@ describe('暂停与中止', () => {
   })
 })
 
+describe('定时', () => {
+  it('巡检结束后总会安排下一轮；巡检中又被要求巡检时，结束后马上再跑', async () => {
+    env = await setup()
+    await (env.guard as any).patrolTick()
+    expect(env.guard.nextPatrolAt).toBe(env.clock.now + 6 * HOUR)
+    env.aa.override('check', { status: 500, body: '{}', delayMs: 200 }, 1)
+    const tick = (env.guard as any).patrolTick()
+    await sleep(50)
+    env.guard.requestPatrol()
+    await tick
+    expect(env.guard.nextPatrolAt).toBe(env.clock.now + 2000)
+  })
+
+  it('机器人不在线：1 分钟后再试', async () => {
+    env = await setup()
+    env.bot.offline()
+    await (env.guard as any).patrolTick()
+    expect(env.guard.nextPatrolAt).toBe(env.clock.now + 60_000)
+  })
+})
+
 describe('通知', () => {
   it('发送通知失败不影响移出，也不影响记录', async () => {
     env = await setup()
