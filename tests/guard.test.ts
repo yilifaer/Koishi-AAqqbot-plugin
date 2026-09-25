@@ -498,7 +498,7 @@ describe('AA 变化（事件）', () => {
     env = await setup()
     env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }, { id: 2, kind: 'card', qq: '40002' }]
     await env.guard.pollEvents()
-    expect(await env.guard.store.getKv('cursor')).toBe(2)
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(2)
     expect(env.aa.count('check')).toBe(0)
     expect((env.guard as any).patrolQueue).toBe('all')
   })
@@ -509,7 +509,7 @@ describe('AA 变化（事件）', () => {
     for (const qq of ['40001', '40002', '40003']) env.aa.allow(qq, `[IGC] ${qq}`)
     await confirmMode('remind')
     await env.guard.runPatrol([GROUP])
-    await env.guard.store.setKv('cursor', 0)
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
     env.aa.requests = []
     env.aa.deny('40001', 'NO_ACCESS') // 40002 仍然合格
     env.aa.events = [
@@ -525,7 +525,7 @@ describe('AA 变化（事件）', () => {
     expect(checks[0].body.qqs.sort()).toEqual(['40001', '40002'])
     expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】[IGC] 40001')
     expect(env.qq.member(GROUP, '40002')!.card).toBe('[IGC] 40002')
-    expect(await env.guard.store.getKv('cursor')).toBe(4)
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(4)
   })
 
   it('事件通道也有熔断：小群里一下子多人变成 deny → 熔断', async () => {
@@ -534,7 +534,7 @@ describe('AA 变化（事件）', () => {
     for (const qq of ['40001', '40002', '40003']) env.aa.allow(qq, `[IGC] ${qq}`)
     await confirmMode('remind')
     await env.guard.runPatrol([GROUP])
-    await env.guard.store.setKv('cursor', 0)
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
     for (const qq of ['40001', '40002', '40003']) env.aa.deny(qq, 'NO_ACCESS')
     env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }, { id: 2, kind: 'recheck', qq: '40002' }, { id: 3, kind: 'recheck', qq: '40003' }]
     await env.guard.pollEvents()
@@ -547,24 +547,37 @@ describe('AA 变化（事件）', () => {
     env = await setup()
     addMembers('40001')
     await env.guard.runPatrol()
-    await env.guard.store.setKv('cursor', 0)
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
     env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }]
     env.aa.override('check', { status: 500, body: '{}' }, 1)
     await env.guard.pollEvents()
-    expect(await env.guard.store.getKv('cursor')).toBe(0)
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(0)
     await env.guard.pollEvents()
-    expect(await env.guard.store.getKv('cursor')).toBe(1)
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(1)
+  })
+
+  it('换了 AA 网址（测试 AA → 正式 AA）：游标重新开始，不沿用旧 AA 的进度', async () => {
+    env = await setup()
+    await env.guard.store.setKv(env.guard.cursorKey, 500)
+    const oldKey = env.guard.cursorKey
+    ;(env.guard as any).aa = new (env.guard.aa.constructor as any)(env.app, { baseUrl: `${env.aa.baseUrl}/`.replace('127.0.0.1', 'localhost'), keyId: env.config.keyId, secret: env.config.secret, timeoutMs: 5000 })
+    expect(env.guard.cursorKey).not.toBe(oldKey)
+    env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }, { id: 2, kind: 'recheck', qq: '40002' }]
+    await env.guard.pollEvents()
+    // 新 AA 第一次运行：从 0 开始拉完，只记游标，然后完整巡检
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(2)
+    expect(await env.guard.store.getKv(oldKey)).toBe(500)
   })
 
   it('recheck_all：安排完整巡检；groups：重新拉取群列表', async () => {
     env = await setup()
-    await env.guard.store.setKv('cursor', 0)
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
     env.aa.groups.push({ group_id: OTHER_GROUP, name: '旗舰群', kind: 'role' })
     env.aa.events = [{ id: 1, kind: 'groups', qq: '' }, { id: 2, kind: 'recheck_all', qq: '' }]
     await env.guard.pollEvents()
     expect(env.guard.groups.map((g) => g.groupId)).toEqual([GROUP, OTHER_GROUP])
     expect((env.guard as any).patrolQueue).toBe('all')
-    expect(await env.guard.store.getKv('cursor')).toBe(2)
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(2)
   })
 })
 
@@ -883,11 +896,11 @@ describe('审查发现的问题（回归测试）', () => {
     env = await setup()
     addMembers('40001')
     await env.guard.runPatrol()
-    await env.guard.store.setKv('cursor', 0)
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
     env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }]
     env.aa.override('check', { status: 403, body: '<html>Forbidden</html>' }, 1)
     await env.guard.pollEvents()
-    expect(await env.guard.store.getKv('cursor')).toBe(1)
+    expect(await env.guard.store.getKv(env.guard.cursorKey)).toBe(1)
   })
 
   it('提醒没发出去：不定截止时间，也就不会被移出', async () => {
