@@ -23,5 +23,11 @@ jobs:
       - run: npm test
         if: matrix.node == 22
       - run: npm run build
-      # 用 Koishi 实际的加载方式（CommonJS）加载编译结果，确认在这个 Node 版本上能用
-      - run: node -e "const p = require('./lib'); if (p.name !== 'aaqqbot' || typeof p.apply !== 'function') process.exit(1); p.Config({ aaBaseUrl: 'https://a.example.com', keyId: 'k', secret: 's' })"
+      # Koishi Desktop 实际用 CommonJS 加载插件；确认编译结果在这个 Node 版本上能加载
+      - name: 用 CommonJS 加载编译结果
+        run: |
+          node -e "
+            const p = require('./lib')
+            if (p.name !== 'aaqqbot' || typeof p.apply !== 'function') process.exit(1)
+            p.Config({ aaBaseUrl: 'https://a.example.com', keyId: 'k', secret: 's' })
+          "

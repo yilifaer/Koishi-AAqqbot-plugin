@@ -237,11 +237,15 @@ export class Guard {
     const queue = this.patrolQueue
     this.patrolQueue = null
     const only = queue === 'all' || queue === null ? undefined : [...queue]
-    const result = await this.runPatrol(only)
-    // 机器人不在线或 AA 连不上时，1 分钟后再试，不要干等一个巡检周期
-    const retrySoon = result === 'no-bot' || result === 'no-groups'
-    if (!this.patrolQueue) {
-      this.schedule('patrol', retrySoon ? 60_000 : this.config.patrolIntervalHours * 3600_000, () => this.patrolTick())
+    let result: Awaited<ReturnType<Guard['runPatrol']>> = 'done'
+    try {
+      result = await this.runPatrol(only)
+    } finally {
+      // 巡检期间又有人要求巡检：马上再跑；机器人不在线或拿不到群列表：1 分钟后再试；否则等一个巡检周期
+      const delay = this.patrolQueue ? 2000
+        : result === 'no-bot' || result === 'no-groups' ? 60_000
+          : this.config.patrolIntervalHours * 3600_000
+      this.schedule('patrol', delay, () => this.patrolTick())
     }
   }
 
