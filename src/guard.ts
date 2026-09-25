@@ -31,6 +31,8 @@ export interface GuardOptions {
   kickDelayMs?: number
   /** 巡检时两个群之间的间隔。 */
   groupDelayMs?: number
+  /** 一轮巡检跑满多久就停下，剩下的群接着巡检（测试用）。 */
+  patrolSoftBudgetMs?: number
 }
 
 export interface ModeInfo {
@@ -54,7 +56,13 @@ interface ApplyResult {
 }
 
 const MAX_CHECK = 3000
-const PATROL_BUDGET_MS = 30 * 60_000
+/** 一轮巡检跑满这么久，就在两个群之间停下，剩下的群马上接着巡检（不让排在后面的群一直轮不到）。 */
+const PATROL_SOFT_BUDGET_MS = 20 * 60_000
+/** 一轮巡检的硬上限：超过就中止（防止卡死）。 */
+const PATROL_BUDGET_MS = 40 * 60_000
+/** 名单比上一轮少了这么多，就怀疑名单不完整。 */
+const ROSTER_DROP_MIN = 5
+const ROSTER_DROP_RATIO = 0.1
 const FLAG_TTL_MS = 30 * 60_000
 const APPROVED_TTL_MS = 10 * 60_000
 const AUDIT_KEEP_MS = 180 * 86400_000
@@ -226,24 +234,44 @@ export class Guard {
   }
 
   async start() {
-    this.paused = (await this.store.getKv<boolean>('paused')) ?? false
-    const saved = await this.store.getKv<ManagedGroup[]>(this.groupsKey)
-    if (Array.isArray(saved) && saved.length) {
-      this.groups = saved
-      this.groupsLoaded = true
+    // 先读暂停状态：读不出来时按「暂停」处理（宁可不动，也不误动）
+    try {
+      this.paused = (await this.store.getKv<boolean>('paused')) ?? false
+    } catch (error) {
+      this.paused = true
+      this.logger.error('读取暂停状态失败，为安全起见先暂停：%s', error)
+      this.notifier.push('⚠ 启动时读取不到数据库里的暂停状态，为安全起见已暂停。检查 Koishi 的数据库插件后，发送 aaqq.resume 恢复。')
     }
-    if (!parseClock(this.config.remindTime)) this.logger.warn('提醒时间 %s 格式不对，应为 19:30 这样的格式', this.config.remindTime)
-    await this.checkHealth(true)
-    await this.refreshGroups()
-    if (this.paused) this.notifier.push('⏸ 插件处于暂停状态：不会审批、提醒、改名片或移出任何人。发送 aaqq.resume 恢复。')
-    // 机器人已经在线（例如改配置后插件重启）时不会再收到上线事件，这里补处理一次积压的申请
-    const bot = this.pickBot()
-    if (bot && this.config.catchUpRequests) await this.catchUpRequests(bot)
+    // 定时任务先安排好：后面任何一步出错，巡检、拉取变化、提醒都照常运行
     if (this.options.timers !== false) {
       this.schedule('patrol', 20_000, () => this.patrolTick())
       this.schedule('events', this.config.eventPollSeconds * 1000, () => this.eventsTick())
       this.schedule('groups', 3600_000, () => this.groupsTick())
       this.scheduleReminder()
+    }
+    if (!parseClock(this.config.remindTime)) this.logger.warn('提醒时间 %s 格式不对，应为 19:30 这样的格式', this.config.remindTime)
+    await this.startStep('读取受管群列表', async () => {
+      const saved = await this.store.getKv<ManagedGroup[]>(this.groupsKey)
+      if (Array.isArray(saved) && saved.length && !this.groupsLoaded) {
+        this.groups = saved
+        this.groupsLoaded = true
+      }
+    })
+    await this.startStep('健康检查', () => this.checkHealth(true))
+    await this.startStep('获取受管群列表', () => this.refreshGroups())
+    if (this.paused) this.notifier.push('⏸ 插件处于暂停状态：不会审批、提醒、改名片或移出任何人。发送 aaqq.resume 恢复。')
+    // 机器人已经在线（例如改配置后插件重启）时不会再收到上线事件，这里补处理一次积压的申请
+    await this.startStep('补处理积压的入群申请', async () => {
+      const bot = this.pickBot()
+      if (bot && this.config.catchUpRequests) await this.catchUpRequests(bot)
+    })
+  }
+
+  private async startStep(what: string, step: () => Promise<unknown>) {
+    try {
+      await step()
+    } catch (error) {
+      if (!this.signal.aborted) this.logger.warn('启动步骤「%s」出错（不影响定时任务）：%s', what, error)
     }
   }
 
@@ -432,8 +460,15 @@ export class Guard {
       const targets = this.groups.filter((g) => !only || only.includes(g.groupId))
       const sections: string[] = []
       let ok = true
+      const realStart = Date.now()
       for (const [index, g] of targets.entries()) {
         throwIfAborted(round.signal)
+        if (index > 0 && Date.now() - realStart >= (this.options.patrolSoftBudgetMs ?? PATROL_SOFT_BUDGET_MS)) {
+          const rest = targets.slice(index)
+          this.requestPatrol(rest.map((x) => x.groupId))
+          sections.push(`⏭ 这一轮时间到了，还有 ${rest.length} 个群马上接着巡检：${rest.map((x) => this.groupLabel(x.groupId)).join('、')}`)
+          break
+        }
         if (index > 0) await sleep(this.options.groupDelayMs ?? 5000, round.signal)
         const section = await this.patrolGroup(bot, g, round.signal)
         if (section.text) sections.push(section.text)
@@ -448,7 +483,7 @@ export class Guard {
       return 'done'
     } catch (error) {
       if (error instanceof AbortedError || round.signal.aborted) {
-        const why = this.paused ? '已暂停' : this.signal.aborted ? '插件已停用或配置已修改' : '超过 30 分钟时限'
+        const why = this.paused ? '已暂停' : this.signal.aborted ? '插件已停用或配置已修改' : '超过 40 分钟时限'
         this.logger.info('巡检中止：%s', why)
         if (!this.signal.aborted) this.notifier.push(`⏹ 巡检已中止（${why}）。`)
         this.lastRound = { at: started, ok: false, text: `巡检中止（${why}）` }
@@ -502,9 +537,14 @@ export class Guard {
       return { ok: false, text: `${head}\n❌ 机器人不在这个群里` }
     }
 
+    // 名单比上一轮明显变少：可能是 LLBot 刚启动、只返回了一部分人。
+    // 这一轮不当作完整名单交给 AA（否则 AA 会删掉不在名单里的老成员），也不据此取消任何人的跟踪。
+    const previous = state.lastRosterSize
+    const drop = previous - members.length
+    const suspicious = previous > 0 && drop > Math.max(ROSTER_DROP_MIN, Math.ceil(previous * ROSTER_DROP_RATIO))
     const qqs = members.map((m) => m.qq)
     const verdicts = new Map<string, Verdict>()
-    const fullRoster = qqs.length <= MAX_CHECK
+    const fullRoster = qqs.length <= MAX_CHECK && !suspicious
     for (const part of chunk(qqs, MAX_CHECK)) {
       const result = await this.aa.check(g.groupId, part, fullRoster, { signal, retryDelays: this.options.retryDelays })
       if (!result.ok) {
@@ -529,7 +569,7 @@ export class Guard {
       held: info.held,
       bypass: this.bypassFor(state, now),
       kickApprovedBefore: state.lastConfirmAt?.getTime() ?? 0,
-      partial: false,
+      partial: suspicious,
       groupSize: members.length,
       members,
       verdicts,
@@ -547,6 +587,7 @@ export class Guard {
       bypassUntil: null,
       lastNewDenies: plan.newDenies.length,
       lastKicksDue: plan.kicksDue,
+      lastRosterSize: members.length,
     }
     if (plan.tripped) {
       patch.holdSince = new Date(now)
@@ -558,7 +599,11 @@ export class Guard {
     await this.store.setGroupState(g.groupId, patch)
 
     const lines = [head, ...this.describePlan(plan, applied, members, info)]
-    if (!fullRoster) lines.push(`⚠ 群人数超过 ${MAX_CHECK}，名单分批提交，AA 上「老成员免验证」对这个群不生效`)
+    if (suspicious) {
+      lines.push(`⚠ 这次取到的名单比上一轮少了 ${drop} 人（${previous} → ${members.length}），可能不完整：本轮不作为完整名单交给 AA，也不取消任何人的跟踪。如果确实有很多人退群，下一轮会恢复正常`)
+    } else if (!fullRoster) {
+      lines.push(`⚠ 群人数超过 ${MAX_CHECK}，名单分批提交，AA 上「老成员免验证」对这个群不生效`)
+    }
     if (plan.tripped) {
       this.notifier.push(`⛔ 熔断：${label} ${plan.tripReason}。\n可能是 AA 配置被改错了。这个群已停止一切处置（不提醒、不改名片、不移出、不拒绝申请），直到管理员确认。\n请先核对 AA 上的设置和下面的名单，确认无误后发送：aaqq.confirm ${g.groupId}`)
     }
@@ -587,7 +632,7 @@ export class Guard {
       held: false,
       bypass: null,
       kickApprovedBefore: 0,
-      partial: false,
+      partial: true, // 只撤掉还在群里的人的标记；名单万一不完整，也不会误删别人的记录
       groupSize: members.length,
       members,
       verdicts: new Map(),
