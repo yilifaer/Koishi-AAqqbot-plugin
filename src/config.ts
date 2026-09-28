@@ -101,7 +101,7 @@ export const Config: Schema<Config> = Schema.intersect([
     ]).default('same')
       .description('群成员邀请别人入群、需要审核时（申请里没有验证信息）怎么处理。'),
     catchUpRequests: Schema.boolean().default(true)
-      .description('机器人重新上线时，补处理掉线期间还挂着的入群申请。'),
+      .description('补处理还挂着的入群申请（插件启动、机器人重新上线、AA 恢复连接、解除暂停时），规则和实时申请一样：合格的同意，不合格的按上面的设置拒绝。'),
   }).description('入群申请'),
 
   Schema.object({

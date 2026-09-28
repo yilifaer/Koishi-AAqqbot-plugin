@@ -133,6 +133,7 @@ export class Guard {
   private patrolQueue: Set<string> | 'all' | null = null
   private eventsBusy = false
   private remindBusy = false
+  private catchUpBusy = false
   private aaDown = false
   private botProblem: string | null = null
   private handledFlags = new Map<string, number>()
@@ -403,6 +404,8 @@ export class Guard {
     if (this.aaDown) {
       this.aaDown = false
       this.notifier.push('✅ AA 已恢复连接。')
+      // AA 掉线期间留下的入群申请，按规则补处理（DECISIONS 第 45 条）
+      this.catchUpSoon()
     }
   }
 
@@ -1045,9 +1048,15 @@ export class Guard {
     if (info.effective === 'off') return
     const label = this.groupLabel(g.groupId)
     const who = `${req.qq}${req.invitorId ? `（由 ${req.invitorId} 邀请）` : ''}`
+    // 这一次没处理成（暂停中、AA 无法判断）：不记「处理过」，恢复后的补处理还能按规则处理它
+    const later = (when: string) => {
+      this.handledFlags.delete(req.flag)
+      this.handledFlags.delete(personKey)
+      return this.config.catchUpRequests ? `（${when}还没人处理的话，会按规则自动补处理）` : ''
+    }
 
     if (this.paused) {
-      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理。`)
+      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理${later('恢复后')}。`)
       return
     }
     if (req.invitorId && this.config.inviteHandling === 'manual') {
@@ -1057,10 +1066,13 @@ export class Guard {
 
     const result = await this.aa.claim(req.qq, req.comment, g.groupId, { signal: this.signal, retryDelays: [2000] })
     if (!result.ok) {
-      if (result.kind === 'aborted') return
+      if (result.kind === 'aborted') {
+        later('')
+        return
+      }
       this.noteAaFailure(result, `入群申请 ${label}`)
       if (result.error === 'unknown_group') await this.refreshGroups()
-      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。AA 无法判断（${describeFailure(result)}），留给管理员处理。`)
+      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。AA 无法判断（${describeFailure(result)}），留给管理员处理${later('AA 恢复后')}。`)
       return
     }
     this.noteAaOk()
@@ -1068,7 +1080,7 @@ export class Guard {
     const outcomeText = result.claimed ? '验证码验证成功' : outcomeLabel(result.outcome)
     // 问 AA 的这段时间里可能暂停了或进入了冷静期：重新读一次
     if (this.paused || this.signal.aborted) {
-      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理。`)
+      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理${later('恢复后')}。`)
       return
     }
     const nowInfo = this.modeInfo(g.groupId, await this.store.groupState(g.groupId))
@@ -1089,7 +1101,8 @@ export class Guard {
     if (verdict.decision === 'deny') {
       const reasonText = reasonShort(verdict.reason)
       const protectedQq = this.protectedIds().has(req.qq)
-      if (this.writeMode(nowInfo) && this.config.autoReject && !protectedQq && !catchUp) {
+      // 补处理的申请和实时的一样处理（DECISIONS 第 45 条）：LLBot 的积压列表分不出是不是邀请，一律按普通申请
+      if (this.writeMode(nowInfo) && this.config.autoReject && !protectedQq) {
         const reason = fillTemplate(this.config.rejectTemplate, { hint: rejectHint(result.outcome, verdict.reason), url: this.bindUrl() }).slice(0, REJECT_REASON_MAX)
         try {
           await this.platform.handleJoinRequest(bot, req.flag, false, reason)
@@ -1101,10 +1114,9 @@ export class Guard {
         return
       }
       const why = protectedQq ? '这个 QQ 在白名单里'
-        : catchUp ? '补处理的申请不自动拒绝（可能是邀请入群）'
-          : nowInfo.cooling && (nowInfo.effective === 'remind' || nowInfo.effective === 'enforce') ? '这个群在冷静期'
-            : this.writeMode(nowInfo) ? '自动拒绝已关闭'
-              : `群模式是 ${nowInfo.effective}`
+        : nowInfo.cooling && (nowInfo.effective === 'remind' || nowInfo.effective === 'enforce') ? '这个群在冷静期'
+          : this.writeMode(nowInfo) ? '自动拒绝已关闭'
+            : `群模式是 ${nowInfo.effective}`
       this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}，AA 判定不合格（${reasonText}；${outcomeText}）。${why}，留给管理员处理。`)
       return
     }
@@ -1113,7 +1125,7 @@ export class Guard {
     this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}，${why}，留给管理员处理。`)
   }
 
-  /** 机器人重新上线：补处理掉线期间积压的入群申请（DECISIONS 第 13 条）。 */
+  /** 机器人重新上线：补处理掉线期间积压的入群申请（DECISIONS 第 13、45 条）。 */
   private async onBotStatus(changed: Bot) {
     if (changed.platform !== 'onebot' || changed.status !== Universal.Status.ONLINE) return
     const bot = this.pickBot()
@@ -1123,20 +1135,38 @@ export class Guard {
     if (!this.lastRound) this.requestPatrol()
   }
 
+  /**
+   * 补处理还挂着的入群申请，规则和实时申请完全一样（该同意的同意、该拒绝的拒绝）。
+   * 在这些时候运行：插件启动、机器人重新上线、AA 恢复连接、解除暂停。已经有人处理过的申请 QQ 会标成已处理，不会重复。
+   */
   async catchUpRequests(bot: Bot) {
-    if (!this.groupsLoaded || this.paused) return
-    let pending
+    if (!this.groupsLoaded || this.paused || this.catchUpBusy) return
+    this.catchUpBusy = true
     try {
-      pending = await this.platform.pendingJoinRequests(bot)
-    } catch (error) {
-      this.logger.warn('补拉入群申请失败（%s）：%s', isOneBotTimeout(error) ? ONEBOT_TIMEOUT_HINT : 'LLBot 可能不支持 get_group_system_msg', errorText(error))
-      return
+      let pending
+      try {
+        pending = await this.platform.pendingJoinRequests(bot)
+      } catch (error) {
+        this.logger.warn('补拉入群申请失败（%s）：%s', isOneBotTimeout(error) ? ONEBOT_TIMEOUT_HINT : 'LLBot 可能不支持 get_group_system_msg', errorText(error))
+        return
+      }
+      for (const req of pending) {
+        if (this.signal.aborted || this.paused) return
+        await this.handleJoinRequest(bot, req, '补处理的入群申请', true)
+        await sleep(1000, this.signal)
+      }
+    } finally {
+      this.catchUpBusy = false
     }
-    for (const req of pending) {
-      if (this.signal.aborted) return
-      await this.handleJoinRequest(bot, req, '补处理的入群申请', true)
-      await sleep(1000, this.signal)
-    }
+  }
+
+  /** 在后台补处理一次积压的申请（AA 恢复连接、解除暂停时）。 */
+  private catchUpSoon() {
+    if (!this.config.catchUpRequests) return
+    this.safely('补处理积压的入群申请', async () => {
+      const bot = this.pickBot()
+      if (bot) await this.catchUpRequests(bot)
+    })
   }
 
   // ------------------------------------------------------------ 新人入群、退群
@@ -1513,6 +1543,7 @@ export class Guard {
       this.round?.abort()
     } else {
       this.requestPatrol()
+      this.catchUpSoon()
     }
   }
 

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { Mode } from '../src/config'
 import { charLength } from '../src/util'
 import {
-  ADMIN, ADMIN_GROUP, BOT, Env, GROUP, OPERATOR, OTHER_GROUP, OWNER, plainMember, setup, sleep,
+  ADMIN, ADMIN_GROUP, BOT, Env, GROUP, OPERATOR, OTHER_GROUP, OWNER, plainMember, setup, sleep, waitFor,
 } from './harness'
 
 let env: Env
@@ -1046,7 +1046,7 @@ describe('审查发现的问题（回归测试）', () => {
     expect((await env.adminMessages()).at(-1)).toContain('白名单')
   })
 
-  it('补处理的申请：合格的同意，不合格的不自动拒绝（可能是邀请入群）', async () => {
+  it('补处理的申请和实时的一样处理：合格的同意，不合格的拒绝', async () => {
     env = await setup()
     await enableMode('enforce')
     env.aa.allow('40001', '[IGC] 甲')
@@ -1057,8 +1057,50 @@ describe('审查发现的问题（回归测试）', () => {
       ],
     }
     await env.guard.catchUpRequests(env.bot as any)
-    expect(env.qq.requests).toEqual([{ flag: '801', approve: true, reason: '' }])
-    expect((await env.adminMessages()).join('\n')).toContain('补处理的申请不自动拒绝')
+    expect(env.qq.requests).toEqual([
+      { flag: '801', approve: true, reason: '' },
+      { flag: '802', approve: false, reason: expect.stringContaining('https://auth.example.com/services/') },
+    ])
+    expect((await env.adminMessages()).join('\n')).toContain('🚫 补处理的入群申请：已拒绝 40002 加入 联盟聊天群（111111111）')
+  })
+
+  it('补处理的申请，report 模式：不合格的不拒绝，留给管理员', async () => {
+    env = await setup()
+    env.qq.systemMsg = { join_requests: [{ request_id: 804, requester_uin: 40002, message: '', group_id: +GROUP, checked: false }] }
+    await env.guard.catchUpRequests(env.bot as any)
+    expect(env.qq.requests).toEqual([])
+    expect((await env.adminMessages()).join('\n')).toContain('群模式是 report，留给管理员处理')
+  })
+
+  it('AA 掉线时来的申请：AA 恢复连接后按规则补处理（该拒绝的拒绝）', async () => {
+    env = await setup()
+    await enableMode('enforce')
+    env.aa.override('claim', { status: 502, body: 'Bad Gateway' }, 2) // 第一次和重试都失败
+    await requestEvent('40002', '')
+    await settle()
+    await sleep(2200) // 等一次重试
+    expect(env.qq.requests).toEqual([])
+    expect((await env.adminMessages()).join('\n')).toContain('AA 恢复后还没人处理的话，会按规则自动补处理')
+    // 申请还挂在 QQ 里；AA 恢复
+    env.qq.systemMsg = { join_requests: [{ request_id: 805, requester_uin: 40002, message: '', group_id: +GROUP, checked: false }] }
+    await env.guard.checkHealth(false)
+    await waitFor(() => env.qq.requests.length > 0)
+    expect(env.qq.requests).toEqual([{ flag: '805', approve: false, reason: expect.stringContaining('https://auth.example.com/services/') }])
+  })
+
+  it('暂停时来的申请：解除暂停后按规则补处理', async () => {
+    env = await setup()
+    await enableMode('enforce')
+    env.aa.allow('40001', '[IGC] 甲')
+    await env.guard.setPaused(true, OPERATOR)
+    await requestEvent('40001', '')
+    await settle()
+    expect(env.qq.requests).toEqual([])
+    expect((await env.adminMessages()).join('\n')).toContain('插件暂停中，留给管理员处理（恢复后还没人处理的话，会按规则自动补处理）')
+    env.qq.systemMsg = { join_requests: [{ request_id: 806, requester_uin: 40001, message: '', group_id: +GROUP, checked: false }] }
+    await env.guard.setPaused(false, OPERATOR)
+    await waitFor(() => env.qq.requests.length > 0)
+    expect(env.qq.requests).toEqual([{ flag: '806', approve: true, reason: '' }])
   })
 
   it('补处理时，刚通过实时事件处理过的人不再重复处理', async () => {
