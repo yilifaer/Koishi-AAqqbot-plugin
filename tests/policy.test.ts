@@ -556,13 +556,16 @@ describe('名片同步', () => {
     expect(plan.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true }])
   })
 
-  it('机器人只是管理员时，不改群主和其他管理员的名片，列进「改不了」', () => {
+  it('机器人只是管理员时，群主和其他管理员的名片也改（所有者实测，DECISIONS 第 44 条）', () => {
     const data = input('remind', [])
     data.verdicts.set('10000', verdict('10000', 'allow', 'OK', '[IGC] 群主'))
     data.verdicts.set('20000', verdict('20000', 'allow', 'OK', '[IGC] 管理'))
     const plan = planGroup(data)
-    expect(plan.cards).toEqual([])
-    expect(plan.adminCardsBlocked).toEqual([{ qq: '10000', to: '[IGC] 群主' }, { qq: '20000', to: '[IGC] 管理' }])
+    expect(plan.cards).toEqual([
+      { qq: '10000', from: '名片10000', to: '[IGC] 群主', why: 'sync', admin: true },
+      { qq: '20000', from: '名片20000', to: '[IGC] 管理', why: 'sync', admin: true },
+    ])
+    expect(plan.adminCardsBlocked).toEqual([])
   })
 
   it('机器人是群主：管理员的名片也改；白名单的永远不改', () => {
@@ -623,10 +626,10 @@ describe('群主、管理员的名片（K1）', () => {
     expect(plan.cards).toEqual([{ qq: '20000', from: '名片20000', to: '[IGC] 管理', why: 'sync', admin: true }])
   })
 
-  it('机器人是管理员：进 adminCardsBlocked，cards 为空', () => {
+  it('机器人是管理员：管理员名片也进 cards（admin）', () => {
     const plan = planGroup(withAdminCard())
-    expect(plan.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
-    expect(plan.cards).toEqual([])
+    expect(plan.cards).toEqual([{ qq: '20000', from: '名片20000', to: '[IGC] 管理', why: 'sync', admin: true }])
+    expect(plan.adminCardsBlocked).toEqual([])
   })
 
   it('机器人是普通成员：不改也不列', () => {
@@ -636,12 +639,14 @@ describe('群主、管理员的名片（K1）', () => {
   })
 
   it('同一张名片被 QQ 拒过：不再重试，列进 adminCardsBlocked；AA 名片变了就再试', () => {
-    const same = planGroup(withAdminCard({ botRole: 'owner', refusedCards: new Map([['20000', '[IGC] 管理']]) }))
-    expect(same.cards).toEqual([])
-    expect(same.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
-    const changed = planGroup(withAdminCard({ botRole: 'owner', refusedCards: new Map([['20000', '[IGC] 旧名片']]) }))
-    expect(changed.cards.map((c) => c.qq)).toEqual(['20000'])
-    expect(changed.adminCardsBlocked).toEqual([])
+    for (const botRole of ['owner', 'admin'] as const) {
+      const same = planGroup(withAdminCard({ botRole, refusedCards: new Map([['20000', '[IGC] 管理']]) }))
+      expect(same.cards).toEqual([])
+      expect(same.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
+      const changed = planGroup(withAdminCard({ botRole, refusedCards: new Map([['20000', '[IGC] 旧名片']]) }))
+      expect(changed.cards.map((c) => c.qq)).toEqual(['20000'])
+      expect(changed.adminCardsBlocked).toEqual([])
+    }
   })
 
   it('白名单、机器人自己、QQ 官方机器人、身份认不出来的：两边都没有', () => {
@@ -664,9 +669,11 @@ describe('群主、管理员的名片（K1）', () => {
     expect(plan.cardsPending).toBe(1)
   })
 
-  it('report 模式、机器人是管理员：照样列进 adminCardsBlocked（只报告）', () => {
+  it('report 模式、机器人是管理员：只计入「名片不一致」，不改也不列', () => {
     const plan = planGroup(withAdminCard({}, 'report'))
-    expect(plan.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
+    expect(plan.cards).toEqual([])
+    expect(plan.adminCardsBlocked).toEqual([])
+    expect(plan.cardsPending).toBe(1)
   })
 
   it('关掉名片同步：管理员也不改、不列', () => {

@@ -64,7 +64,7 @@ export interface CardNote {
   qq: string
   /** 当时 AA 给的名片。 */
   card: string
-  /** role：机器人身份不够；refused：QQ 拒绝了（同一张名片不再重试）。 */
+  /** refused：QQ 拒绝了（同一张名片不再重试）；role：机器人身份不够（0.2.0 留下的，0.2.1 起会重新试一次）。 */
   why: string
   reportedAt: Date
 }

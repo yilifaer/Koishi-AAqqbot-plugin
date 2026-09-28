@@ -60,7 +60,7 @@ describe('巡检：report 模式', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0]).toContain('成员 4（不含机器人）：合格 3｜不合格 1（新发现 1）｜需人工 0｜无法判断 0')
     expect(messages[0]).toContain('新发现不合格 1 人\n【没有在 AA 绑定 QQ】\n· 名片40002(40002)')
-    expect(messages[0]).toContain('· 1 人的名片与 AA 不一致（report 模式不修改）')
+    expect(messages[0]).toContain('· 3 人的名片与 AA 不一致（report 模式不修改）') // 40001、群主、管理员
   })
 
   it('设了 enforce：下一轮直接生效，报告里有「模式已从 report … 改为 enforce」', async () => {
@@ -568,7 +568,9 @@ describe('冷静期（K3）', () => {
     expect(await env.guard.store.countAudit('cool-start', GROUP, new Date(0))).toBe(2)
     expect(await env.guard.store.countAudit('cool-release', GROUP, new Date(0))).toBe(2)
     const untouchable = [OWNER, ADMIN, BOT]
-    expect(env.qq.actions('set_group_card').filter((c) => untouchable.includes(String(c.params.user_id)))).toEqual([])
+    // 群主、管理员的名片只会被同步成 AA 给的（K1），从不加标记；机器人自己的不改
+    const cards = env.qq.actions('set_group_card').filter((c) => untouchable.includes(String(c.params.user_id)))
+    expect(cards.map((c) => [String(c.params.user_id), c.params.card]).sort()).toEqual([[OWNER, '[IGC] 群主'], [ADMIN, '[IGC] 管理员']].sort())
     expect(env.qq.actions('set_group_kick').filter((c) => untouchable.includes(String(c.params.user_id)))).toEqual([])
     expect(env.qq.groupMessages(GROUP).flatMap((m) => m.ats).filter((qq) => untouchable.includes(qq))).toEqual([])
   })
@@ -1073,10 +1075,11 @@ describe('审查发现的问题（回归测试）', () => {
     env = await setup()
     addMembers('40001')
     env.qq.member(GROUP, '40001')!.card = '张三'
+    env.qq.failCard.add(ADMIN) // QQ 不让改管理员的名片 → 有一条名片记录
     await enableMode('remind')
     await env.guard.runPatrol([GROUP])
     expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】张三')
-    expect((await env.guard.store.cardNotes(GROUP)).size).toBe(2) // 群主、管理员的名片机器人改不了
+    expect((await env.guard.store.cardNotes(GROUP)).size).toBe(1)
     setMode('off')
     await env.guard.runPatrol()
     expect(env.qq.member(GROUP, '40001')!.card).toBe('张三')
@@ -1089,9 +1092,10 @@ describe('审查发现的问题（回归测试）', () => {
     const people = ['40001', '40002', '40003']
     addMembers(...people)
     await enableMode('remind') // 3 人 > 阈值 1 → 冷静期
+    await env.guard.store.saveCardNote(GROUP, ADMIN, '[IGC] 管理员', 'refused')
     expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
     expect((await env.guard.store.tracked(GROUP)).size).toBe(3)
-    expect((await env.guard.store.cardNotes(GROUP)).size).toBe(2)
+    expect((await env.guard.store.cardNotes(GROUP)).size).toBe(1)
     const groups = env.aa.groups
     env.aa.groups = []
     await env.guard.refreshGroups()
@@ -1202,7 +1206,7 @@ describe('第二轮问题清单（回归测试）', () => {
 })
 
 describe('群主、管理员的名片（K1）', () => {
-  const HEADER = '管理员名片与 AA 不一致（机器人没有权限改，请自己改）'
+  const HEADER = '管理员名片与 AA 不一致（机器人改不了，请自己改）'
   const cardCalls = (qq: string) => env.qq.actions('set_group_card').filter((c) => String(c.params.user_id) === qq)
   const last = async () => (await env.adminMessages()).at(-1)!
 
@@ -1223,43 +1227,39 @@ describe('群主、管理员的名片（K1）', () => {
     expect(report).not.toContain(HEADER)
   })
 
-  it('机器人是管理员：不改，在运维群列一次；AA 名片变了再列一次', async () => {
+  it('机器人只是管理员：群主和其他管理员的名片也改成 AA 的（所有者实测）', async () => {
     env = await setup()
     await enableMode('remind')
-    expect(cardCalls(OWNER)).toEqual([])
-    expect(cardCalls(ADMIN)).toEqual([])
-    const first = await last()
-    expect(first).toContain(`${HEADER}2 人\n· 群主(10001) → [IGC] 群主\n· 管理员(10002) → [IGC] 管理员`)
-    expect(await env.guard.store.countAudit('admin-card', GROUP, new Date(0))).toBe(2)
-    await env.guard.runPatrol()
-    expect(await last()).not.toContain(HEADER)
-    env.aa.allow(ADMIN, '[IGC] 管理员 - 新')
-    await env.guard.runPatrol()
-    const third = await last()
-    expect(third).toContain(`${HEADER}1 人\n· 管理员(10002) → [IGC] 管理员 - 新`)
-    expect(third).not.toContain('群主(10001) →')
+    expect(env.qq.member(GROUP, OWNER)!.card).toBe('[IGC] 群主')
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('[IGC] 管理员')
+    const report = await last()
+    expect(report).toContain('· 同步名片 2 人（其中群主/管理员 2 人）')
+    expect(report).not.toContain(HEADER)
+    expect((await env.guard.store.cardNotes(GROUP)).size).toBe(0)
   })
 
-  it('机器人是群主但 QQ 拒绝：列一次，同一张名片不再重试；AA 名片变了再试一次', async () => {
-    env = await setup()
-    botIsOwner()
-    env.qq.failCard.add(ADMIN)
-    await enableMode('remind')
-    expect(cardCalls(ADMIN)).toHaveLength(1)
-    expect(await last()).toContain(`${HEADER}1 人\n· 管理员(10002) → [IGC] 管理员`)
-    expect((await env.guard.store.cardNotes(GROUP)).get(ADMIN)).toMatchObject({ card: '[IGC] 管理员', why: 'refused' })
-    await env.guard.runPatrol()
-    expect(cardCalls(ADMIN)).toHaveLength(1)
-    expect(await last()).not.toContain(HEADER)
-    env.aa.allow(ADMIN, '[IGC] 管理员 - 新')
-    await env.guard.runPatrol()
-    expect(cardCalls(ADMIN)).toHaveLength(2)
-    expect(await last()).toContain('· 管理员(10002) → [IGC] 管理员 - 新')
-  })
+  for (const botRole of ['admin', 'owner'] as const) {
+    it(`QQ 拒绝（机器人是${botRole === 'owner' ? '群主' : '管理员'}）：列一次，同一张名片不再重试；AA 名片变了再试一次`, async () => {
+      env = await setup()
+      if (botRole === 'owner') botIsOwner()
+      env.qq.failCard.add(ADMIN)
+      await enableMode('remind')
+      expect(cardCalls(ADMIN)).toHaveLength(1)
+      expect(await last()).toContain(`${HEADER}1 人\n· 管理员(10002) → [IGC] 管理员`)
+      expect((await env.guard.store.cardNotes(GROUP)).get(ADMIN)).toMatchObject({ card: '[IGC] 管理员', why: 'refused' })
+      expect(await env.guard.store.countAudit('admin-card', GROUP, new Date(0))).toBe(1)
+      await env.guard.runPatrol()
+      expect(cardCalls(ADMIN)).toHaveLength(1)
+      expect(await last()).not.toContain(HEADER)
+      env.aa.allow(ADMIN, '[IGC] 管理员 - 新')
+      await env.guard.runPatrol()
+      expect(cardCalls(ADMIN)).toHaveLength(2)
+      expect(await last()).toContain('· 管理员(10002) → [IGC] 管理员 - 新')
+    })
+  }
 
   it('改名片超时：不列、不记；超时解除后下一轮改成功', async () => {
     env = await setup()
-    botIsOwner()
     env.qq.timeoutActions.add('set_group_card')
     await enableMode('remind')
     expect(await last()).not.toContain(HEADER)
@@ -1269,8 +1269,9 @@ describe('群主、管理员的名片（K1）', () => {
     expect(env.qq.member(GROUP, ADMIN)!.card).toBe('[IGC] 管理员')
   })
 
-  it('管理员自己改好名片：记录保留；再改乱（AA 名片没变）不再报；AA 名片变了再报', async () => {
+  it('QQ 拒绝后管理员自己改好名片：记录保留；再改乱（AA 名片没变）不再报、不重试；AA 名片变了再报', async () => {
     env = await setup()
+    env.qq.failCard.add(ADMIN)
     await enableMode('remind')
     expect(await last()).toContain('· 管理员(10002) → [IGC] 管理员')
     env.qq.member(GROUP, ADMIN)!.card = '[IGC] 管理员'
@@ -1279,6 +1280,7 @@ describe('群主、管理员的名片（K1）', () => {
     env.qq.member(GROUP, ADMIN)!.card = '乱改的'
     await env.guard.runPatrol()
     expect(await last()).not.toContain('管理员(10002) →')
+    expect(cardCalls(ADMIN)).toHaveLength(1)
     env.aa.allow(ADMIN, '[IGC] 管理员 - 新')
     await env.guard.runPatrol()
     expect(await last()).toContain('· 乱改的(10002) → [IGC] 管理员 - 新')
@@ -1294,30 +1296,49 @@ describe('群主、管理员的名片（K1）', () => {
     expect(await last()).not.toContain('(12345) →')
   })
 
-  for (const mode of ['report', 'remind'] as const) {
-    it(`事件复查路径（${mode}）：管理员在 AA 变成合格 → 【AA 变化复查】里列出；下一次巡检不重复`, async () => {
-      env = await setup()
-      env.aa.deny(ADMIN)
-      await enableMode(mode)
-      await env.guard.store.setKv(env.guard.cursorKey, 0)
-      env.aa.allow(ADMIN, '[IGC] 管理员')
-      env.aa.events = [{ id: 1, kind: 'card', qq: ADMIN }]
-      await env.guard.pollEvents()
-      const recheck = await last()
-      expect(recheck).toContain('【AA 变化复查】')
-      expect(recheck).toContain(`${HEADER}1 人\n· 管理员(10002) → [IGC] 管理员`)
-      await env.guard.runPatrol()
-      expect(await last()).not.toContain('管理员(10002) →')
-    })
-  }
-
-  it('列过的管理员：机器人升成群主后下一轮直接改好，删掉记录，不再列', async () => {
+  it('事件复查路径：管理员在 AA 变成合格 → remind 群直接改好名片', async () => {
     env = await setup()
+    env.aa.deny(ADMIN)
     await enableMode('remind')
-    expect((await env.guard.store.cardNotes(GROUP)).size).toBe(2)
-    await env.adminMessages()
-    botIsOwner()
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
+    env.aa.allow(ADMIN, '[IGC] 管理员')
+    env.aa.events = [{ id: 1, kind: 'card', qq: ADMIN }]
+    await env.guard.pollEvents()
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('[IGC] 管理员')
+    expect(await last()).toContain('【AA 变化复查】')
+  })
+
+  it('事件复查路径：QQ 拒绝时【AA 变化复查】里列出；下一次巡检不重复、不重试', async () => {
+    env = await setup()
+    env.aa.deny(ADMIN)
+    env.qq.failCard.add(ADMIN)
+    await enableMode('remind')
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
+    env.aa.allow(ADMIN, '[IGC] 管理员')
+    env.aa.events = [{ id: 1, kind: 'card', qq: ADMIN }]
+    await env.guard.pollEvents()
+    const recheck = await last()
+    expect(recheck).toContain('【AA 变化复查】')
+    expect(recheck).toContain(`${HEADER}1 人\n· 管理员(10002) → [IGC] 管理员`)
     await env.guard.runPatrol()
+    expect(await last()).not.toContain('管理员(10002) →')
+    expect(cardCalls(ADMIN)).toHaveLength(1)
+  })
+
+  it('report 群：管理员名片只计入「名片不一致」，不改也不列', async () => {
+    env = await setup()
+    await env.guard.runPatrol()
+    const report = await last()
+    expect(report).toContain('· 2 人的名片与 AA 不一致（report 模式不修改）')
+    expect(report).not.toContain(HEADER)
+    expect(env.qq.actions('set_group_card')).toEqual([])
+  })
+
+  it('0.2.0 留下的「身份不够」记录：0.2.1 会重新试一次，改成功就删掉记录、不再列', async () => {
+    env = await setup()
+    await env.guard.store.saveCardNote(GROUP, OWNER, '[IGC] 群主', 'role')
+    await env.guard.store.saveCardNote(GROUP, ADMIN, '[IGC] 管理员', 'role')
+    await enableMode('remind')
     expect(env.qq.member(GROUP, ADMIN)!.card).toBe('[IGC] 管理员')
     expect(env.qq.member(GROUP, OWNER)!.card).toBe('[IGC] 群主')
     expect((await env.guard.store.cardNotes(GROUP)).size).toBe(0)
@@ -1329,7 +1350,8 @@ describe('群主、管理员的名片（K1）', () => {
     const people = Array.from({ length: 20 }, (_, i) => String(40001 + i))
     addMembers(...people)
     for (const qq of people) env.aa.allow(qq, `名片${qq}`)
-    await env.guard.runPatrol()
+    env.qq.failCard.add(ADMIN)
+    await enableMode('remind')
     expect(await last()).toContain('· 管理员(10002) → [IGC] 管理员')
     // LLBot 只返回了一部分人（管理员不在里面）
     const group = env.qq.groups.get(GROUP)!
@@ -1341,6 +1363,7 @@ describe('群主、管理员的名片（K1）', () => {
     env.qq.groups.set(GROUP, saved)
     await env.guard.runPatrol()
     expect(await last()).not.toContain('管理员(10002) →')
+    expect(cardCalls(ADMIN)).toHaveLength(1)
   })
 })
 
@@ -1517,7 +1540,7 @@ describe('报告排版与名字（K5–K8）', () => {
     const report = await last()
     expect(report.match(/【没有在 AA 绑定 QQ】/g)).toHaveLength(1)
     expect(report).toContain('新发现不合格 3 人\n【没有在 AA 绑定 QQ】\n· 名片40001(40001)\n· 名片40002(40002)\n· 名片40003(40003)')
-    expect(report).toContain('本轮动作\n· 加标记 3 人')
+    expect(report).toContain('本轮动作\n· 同步名片 2 人（其中群主/管理员 2 人）\n· 加标记 3 人')
   })
 
   it('一个分类最多列 15 人，其余写「另外 N 人」', async () => {

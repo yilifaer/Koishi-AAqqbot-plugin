@@ -844,7 +844,10 @@ export class Guard {
     notes ??= await this.store.cardNotes(groupId)
     const byQq = new Map(members.map((m) => [m.qq, m]))
     const blocked = new Map<string, { to: string; why: string }>()
-    for (const item of plan.adminCardsBlocked) blocked.set(item.qq, { to: item.to, why: 'role' })
+    // 计划里的「改不了」：同一张名片被 QQ 拒过（名片记录里有），否则是机器人身份不够
+    for (const item of plan.adminCardsBlocked) {
+      blocked.set(item.qq, { to: item.to, why: notes.get(item.qq)?.why === 'refused' ? 'refused' : 'role' })
+    }
     for (const item of applied.adminRefused) blocked.set(item.qq, { to: item.to, why: 'refused' })
 
     const entries: string[] = []
@@ -875,7 +878,7 @@ export class Guard {
       }
     }
     const lines = entries.length
-      ? [`管理员名片与 AA 不一致（机器人没有权限改，请自己改）${entries.length} 人`, ...limitList(entries)]
+      ? [`管理员名片与 AA 不一致（机器人改不了，请自己改）${entries.length} 人`, ...limitList(entries)]
       : []
     return { lines, save, drop: [...drop] }
   }

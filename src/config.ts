@@ -110,7 +110,7 @@ export const Config: Schema<Config> = Schema.intersect([
     eventPollSeconds: Schema.natural().min(30).max(600).default(60)
       .description('每隔几秒向 AA 拉取一次变化（解绑、退组等），发现后立即复查相关的人。'),
     syncCards: Schema.boolean().default(true)
-      .description('按 AA 算好的名片同步合格成员的群名片（只在 remind / enforce 模式的群里；成员自己改掉的会在下次巡检时改回）。群主、管理员也同步（机器人是群主时才能改管理员；改不了的会在运维群列出来一次）。'),
+      .description('按 AA 算好的名片同步合格成员的群名片（只在 remind / enforce 模式的群里；成员自己改掉的会在下次巡检时改回）。群主、管理员也同步（QQ 不让改时会在运维群列出来一次）。'),
   }).description('巡检与群名片'),
 
   Schema.object({

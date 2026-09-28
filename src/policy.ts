@@ -124,7 +124,7 @@ export interface Plan {
   kicksDeferred: number
   /** 不允许改动时，本来要同步的名片数（写进报告）。 */
   cardsPending: number
-  /** 机器人按身份改不了、或同一张名片被 QQ 拒过的管理员名片（K1）。 */
+  /** 改不了的群主 / 管理员名片（K1）：同一张名片被 QQ 拒过（不再重试），或者机器人身份不够。 */
   adminCardsBlocked: Array<{ qq: string; to: string }>
 }
 
@@ -154,11 +154,13 @@ export function syncKind(member: Member, protectedIds: Set<string>): 'member' | 
   return null
 }
 
-/** QQ 的规矩：群主能改管理员和普通成员；管理员只能改普通成员。 */
+/**
+ * 机器人能不能改这个人的名片：机器人是群主或管理员时，普通成员、管理员、群主的都能改
+ * （所有者实测：机器人只是管理员时也能改群主和其他管理员的名片，DECISIONS 第 44 条）。
+ * QQ 真的拒绝时由 applyPlan 记下来，同一张名片不再重试。
+ */
 export function canSetCard(botRole: Role | null, target: Member): boolean {
-  if (target.role === 'member') return botRole === 'owner' || botRole === 'admin'
-  if (target.role === 'admin') return botRole === 'owner'
-  return false
+  return botCanWrite(botRole) && (target.role === 'member' || target.role === 'admin' || target.role === 'owner')
 }
 
 export function markedCard(prefix: string, member: Member): string {
