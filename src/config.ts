@@ -39,6 +39,9 @@ export interface Config {
   warnTemplate: string
   markAdmins: boolean
   adminRemindTemplate: string
+  fastReasons: string[]
+  fastGraceHours: number
+  fastTemplate: string
   markCards: boolean
   markPrefix: string
   kickAnnounce: boolean
@@ -79,7 +82,7 @@ export const Config: Schema<Config> = Schema.intersect([
     operators: Schema.array(Schema.string()).role('table').default([])
       .description('运维名单（QQ 号）：只有名单里、并且 Koishi 权限等级 ≥ 3 的人能用管理命令。'),
     whitelist: Schema.array(Schema.string()).role('table').default([])
-      .description('白名单（QQ 号）：这些人永远不会被提醒、加标记或移出，名片也不改。机器人自己已自动保护，不用填。群主、管理员永远不会被移出；他们不合格时加不加标记、提不提醒，看「宽限、提醒与标记」里的开关——想让某个管理员完全不被打扰，把他加进白名单。'),
+      .description('白名单（QQ 号）：这些人永远不会被提醒、加标记或移出，名片也不改。机器人自己已自动保护，不用填。群主、管理员永远不会被移出；他们不合格时加不加标记、提不提醒，看「宽限、提醒与标记」里的开关——想让某个管理员完全不被打扰，把他加进白名单。每一条只填一个 QQ 号；写错的条目不生效，启动时和 aaqq.status 里会提示。'),
   }).description('机器人与运维'),
 
   Schema.object({
@@ -128,6 +131,12 @@ export const Config: Schema<Config> = Schema.intersect([
       .description('不合格的群主、管理员也加标记，并在每日提醒时单独 @ 他们（remind / enforce 模式）。他们**永远不会被移出**。关掉后，下一轮巡检撤掉他们身上的标记。白名单里的人不受影响。'),
     adminRemindTemplate: Schema.string().role('textarea').default('以下群主/管理员还没有满足本群的要求（不会被移出），请尽快在联盟 AA 处理：{url}\n{list}')
       .description('提醒不合格的群主、管理员时用的文字（没有截止时间）。`{list}` 是被 @ 的人和原因，`{url}` 是绑定网址。'),
+    fastReasons: Schema.array(Schema.string()).role('table').default(['NO_ACCESS', 'USER_INACTIVE'])
+      .description('「离开联盟」类原因：AA 判成这些原因的人不等每日提醒，一发现就 @ 提醒；enforce 模式下过了下面的时间就移出，不等巡检。填 AA 的原因码（`NO_ACCESS` 没有成员资格、`USER_INACTIVE` 账号已停用）。群主、管理员、白名单不受影响；因为人太多进过冷静期的那一批照旧按每日提醒和上面的宽限期处理。'),
+    fastGraceHours: Schema.natural().min(1).max(48).default(2)
+      .description('「离开联盟」类原因的宽限时间（小时）：从被 @ 提醒开始算，到点就移出（enforce 模式）。注意：在联盟里换军团、中途待在 NPC 军团的人，AA 也会判成没有成员资格，过了这个时间同样会被移出（不拉黑，可以重新申请）。'),
+    fastTemplate: Schema.string().role('textarea').default('{list}\n你在联盟 AA 上已不再具备本群成员资格，将在截止时间被移出本群。如有误会请尽快联系管理员。')
+      .description('「离开联盟」类原因的提醒文字（enforce 模式；remind 模式用上面的 remind 提醒文字）。`{list}` 是被 @ 的人、原因和截止时间，`{url}` 是绑定网址。'),
     markCards: Schema.boolean().default(true)
       .description('给不合格的人的群名片前面加标记（remind / enforce 模式）。合格后自动改成 AA 给的名片。'),
     markPrefix: Schema.string().default('【SPY】')
