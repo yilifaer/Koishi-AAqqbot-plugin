@@ -1991,6 +1991,152 @@ describe('通知失败不重发（K11）', () => {
   })
 })
 
+describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）', () => {
+  const HIDDEN = '（名字含 QQ 不允许的内容，已隐藏）'
+  const adminSends = () => env.qq.actions('send_group_msg').filter((c) => String(c.params.group_id) === ADMIN_GROUP)
+  const delivered = () => env.qq.groupMessages(ADMIN_GROUP).map((m) => m.text)
+  const names = (text: string) => text.match(/\(\d{5,12}\)/g) ?? []
+  const listLines = (text: string) => text.split('\n').filter((line) => /\(\d{5,12}\)/.test(line)).length
+
+  /** 仿照正式环境的巡检报告：4 个群，每群 20 人。 */
+  function report(badName = '') {
+    let qq = 40000
+    const sections = Array.from({ length: 4 }, (_, g) => [
+      `▶ 第${g + 1}群（${100000000 + g}）　enforce（提醒并移出）`,
+      '仍不合格 20 人',
+      '【没有在 AA 绑定 QQ】',
+      ...Array.from({ length: 20 }, () => {
+        qq++
+        return `· ${badName && qq === 40025 ? badName : `名字${qq}`}(${qq})`
+      }),
+    ].join('\n'))
+    return ['【AA 巡检】09-29 03:50 完成，用时 12 秒', ...sections].join('\n\n')
+  }
+
+  it('没有被拒时：名单每条最多 20 行，一次发完', async () => {
+    env = await setup()
+    const text = report()
+    env.guard.notifier.push(text)
+    const messages = await env.adminMessages()
+    expect(messages.length).toBeGreaterThanOrEqual(4)
+    for (const m of messages) expect(listLines(m)).toBeLessThanOrEqual(20)
+    expect(messages.flatMap(names)).toEqual(names(text))
+    expect(adminSends()).toHaveLength(messages.length)
+  })
+
+  it('QQ 拒收超过 10 行名单的消息：对半拆开重发，名单全部送达，没有名字被隐藏', async () => {
+    env = await setup()
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && listLines(text) > 10
+    const text = report()
+    env.guard.notifier.push(text)
+    const messages = await env.adminMessages()
+    expect(messages.flatMap(names)).toEqual(names(text))
+    expect(messages.join('\n')).not.toContain(HIDDEN)
+    expect(messages.length).toBeGreaterThan(4)
+    expect(messages.some((m) => /^（\d+\/4-1）/.test(m))).toBe(true) // 例如（3/4-1）
+    expect(messages.some((m) => /^（\d+\/4-2-2）/.test(m))).toBe(true) // 拆开后还被拒的再拆：（3/4-2-2）
+    for (const m of messages) expect(listLines(m)).toBeLessThanOrEqual(10)
+    expect(adminSends().length).toBeLessThanOrEqual(30) // 被拒的那几次也计入每小时上限
+  })
+
+  it('某个名字单独一行也被拒：只有这一行的名字被隐藏，其他照常送达', async () => {
+    env = await setup()
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && text.includes('坏词')
+    const text = report('坏词张三')
+    env.guard.notifier.push(text)
+    const messages = await env.adminMessages()
+    const all = messages.join('\n')
+    expect(all).not.toContain('坏词')
+    expect(all).toContain(`· ${HIDDEN}(40025)`)
+    expect(all.split(HIDDEN)).toHaveLength(2) // 只隐藏了一行
+    expect(messages.flatMap(names)).toEqual(names(text))
+  })
+
+  it('LLBot 响应超时：不拆、不重发', async () => {
+    env = await setup()
+    env.qq.timeoutActions.add('send_group_msg')
+    env.guard.notifier.push(report())
+    await env.guard.notifier.flush()
+    const parts = adminSends().length
+    expect(parts).toBeGreaterThanOrEqual(4)
+    expect(parts).toBeLessThanOrEqual(5) // 每条只发一次
+  })
+
+  it('什么都被拒（例如机器人被禁言）：拆开重发也不超过每小时 30 条；一小时后的第一条说明之前有几条没发出', async () => {
+    env = await setup()
+    env.qq.refuseSend = (_, groupId) => groupId === ADMIN_GROUP
+    env.guard.notifier.push(report())
+    await env.guard.notifier.flush()
+    expect(adminSends()).toHaveLength(30)
+    env.guard.notifier.push('测试通知')
+    await env.guard.notifier.flush()
+    expect(adminSends()).toHaveLength(30)
+    env.qq.refuseSend = null
+    env.clock.now += HOUR
+    env.guard.notifier.push('测试通知')
+    const [message] = await env.adminMessages()
+    expect(message).toMatch(/^（之前有 \d+ 条通知因为限速没有发出，请看 Koishi 日志）\n测试通知$/)
+  })
+
+  it('拆出来的消息计入每小时上限：前面已经发了 26 条，被拒的那条只能再发 3 条，其余只写日志', async () => {
+    env = await setup()
+    for (let i = 0; i < 26; i++) {
+      env.guard.notifier.push(`通知 ${i}`)
+      await env.guard.notifier.flush()
+    }
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && listLines(text) > 5
+    env.guard.notifier.push(Array.from({ length: 20 }, (_, i) => `· 名字${40001 + i}(${40001 + i})`).join('\n'))
+    await env.guard.notifier.flush()
+    expect(adminSends()).toHaveLength(30)
+    env.qq.refuseSend = null
+    env.clock.now += HOUR
+    env.guard.notifier.push('测试通知')
+    expect((await env.adminMessages()).at(-1)).toMatch(/^（之前有 \d+ 条通知因为限速没有发出/)
+  })
+
+  it('被拒的那条带着「之前有 N 条没发出」的说明：拆开后说明留在第一段，不会丢', async () => {
+    env = await setup()
+    for (let i = 0; i < 30; i++) {
+      env.guard.notifier.push(`通知 ${i}`)
+      await env.guard.notifier.flush()
+    }
+    env.guard.notifier.push('这条被限速') // 只写日志
+    await env.guard.notifier.flush()
+    env.clock.now += HOUR
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && listLines(text) > 10
+    env.guard.notifier.push(Array.from({ length: 20 }, (_, i) => `· 名字${40001 + i}(${40001 + i})`).join('\n'))
+    const messages = (await env.adminMessages()).slice(30)
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatch(/^（之前有 1 条通知因为限速没有发出，请看 Koishi 日志）\n（1\/1-1）· 名字40001\(40001\)/)
+    expect(messages[1].startsWith('（1/1-2）')).toBe(true)
+  })
+
+  it('真的巡检：3 个群各 15 个没绑定的人，报告分成几条、每条最多 20 行名单，名字一个不少', async () => {
+    env = await setup()
+    const extra = ['444444441', '444444442']
+    for (const groupId of extra) {
+      env.aa.groups.push({ group_id: groupId, name: `群${groupId.slice(-1)}`, kind: 'fixed' })
+      env.qq.addGroup(groupId, [
+        { user_id: +BOT, role: 'admin', card: '机器人', nickname: 'bot' },
+        ...Array.from({ length: 15 }, (_, i) => plainMember(`${groupId.slice(-1)}${50001 + i}`, `名片${groupId.slice(-1)}${50001 + i}`)),
+      ])
+    }
+    addMembers(...Array.from({ length: 15 }, (_, i) => String(40001 + i)))
+    await env.guard.refreshGroups()
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && listLines(text) > 20
+    await env.guard.runPatrol()
+    const messages = await env.adminMessages()
+    for (const m of messages) expect(listLines(m)).toBeLessThanOrEqual(20)
+    const all = messages.join('\n')
+    for (let i = 0; i < 15; i++) {
+      expect(all).toContain(`(${40001 + i})`)
+      expect(all).toContain(`(1${50001 + i})`)
+      expect(all).toContain(`(2${50001 + i})`)
+    }
+    expect(delivered()).toHaveLength(adminSends().length) // 一条都没被拒
+  })
+})
+
 describe('消息分段（K13）', () => {
   async function addGroups(count: number, nameLength: number) {
     for (let i = 0; i < count; i++) {

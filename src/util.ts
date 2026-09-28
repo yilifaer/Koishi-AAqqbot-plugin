@@ -165,6 +165,26 @@ export function isOneBotRefusal(error: unknown): boolean {
 /** QQ 单条消息按不超过这么多字发。 */
 export const MAX_MESSAGE_CHARS = 1500
 
+/**
+ * 带名单的消息（运维通知）：每条最多这么多名单行、这么多字。
+ * QQ 的内容审核按整条消息判断，一长串「名字 + QQ 号」凑在一起会被当成广告拒收（DECISIONS 第 62 条）。
+ */
+export const MAX_LIST_LINES = 20
+export const MAX_LIST_CHARS = 800
+
+/** 名单行：带「(QQ号)」的行，例如「· 张三(12345678)」「⚡ … 张三(12345678) 已不具备成员资格…」。 */
+const LIST_LINE = /\(\d{5,12}\)/
+
+export function isListLine(line: string): boolean {
+  return LIST_LINE.test(line)
+}
+
+/** 带名单的消息的额外上限：lines 行名单、chars 字。 */
+export interface ListLimits {
+  lines: number
+  chars: number
+}
+
 /** 按字符（不是 UTF-16 码元）计数，emoji 算 1 个。 */
 export function charLength(text: string): number {
   return Array.from(text).length
@@ -173,48 +193,70 @@ export function charLength(text: string): number {
 /**
  * 把一段文字切成每条不超过 max 字的若干条：优先在空行（小节边界）切，其次在换行切；
  * 单独一行还是太长才硬切（结尾加「…」），不会切断汉字或 emoji。切成多条时每条开头加（i/N）。
+ * 给了 list 时，带名单行的那几条还要满足名单的上限（最多 list.lines 行名单、list.chars 字）。
  */
-export function splitMessage(text: string, max = MAX_MESSAGE_CHARS): string[] {
-  if (charLength(text) <= max) return [text]
-  const parts = splitInto(text, max - 12) // 给（i/N）序号留位置
+export function splitMessage(text: string, max = MAX_MESSAGE_CHARS, list?: ListLimits): string[] {
+  if (fitsLimits(charLength(text), countListLines(text), max, list)) return [text]
+  // 给（i/N）序号留位置
+  const parts = splitInto(text, max - 12, list && { lines: list.lines, chars: list.chars - 12 })
   if (parts.length <= 1) return parts
   return parts.map((part, index) => `（${index + 1}/${parts.length}）${part}`)
 }
 
-function splitInto(text: string, limit: number): string[] {
-  // 先拆成「单元」：小节（空行分隔）→ 太长的小节再拆成行 → 太长的行再硬切
-  const units: Array<{ text: string; sep: string }> = []
+/** 一段文字里的名单行数。 */
+export function countListLines(text: string): number {
+  return text.split('\n').filter(isListLine).length
+}
+
+/** length 字、listLines 行名单的一条消息是否在上限之内。 */
+export function fitsLimits(length: number, listLines: number, max: number, list?: ListLimits): boolean {
+  if (length > max) return false
+  return !list || listLines === 0 || (listLines <= list.lines && length <= list.chars)
+}
+
+function splitInto(text: string, limit: number, list?: ListLimits): string[] {
+  // 先拆成「单元」：小节（空行分隔）→ 太长（或名单太多）的小节再拆成行 → 太长的行再硬切
+  const units: Array<{ text: string; sep: string; length: number; listLines: number }> = []
+  const add = (piece: string, sep: string) => {
+    units.push({ text: piece, sep, length: charLength(piece), listLines: isListLine(piece) ? 1 : 0 })
+  }
   text.split(/\n{2,}/).forEach((block, blockIndex) => {
     const blockSep = blockIndex === 0 ? '' : '\n\n'
-    if (charLength(block) <= limit) {
-      units.push({ text: block, sep: blockSep })
+    const blockListLines = countListLines(block)
+    if (fitsLimits(charLength(block), blockListLines, limit, list)) {
+      units.push({ text: block, sep: blockSep, length: charLength(block), listLines: blockListLines })
       return
     }
     block.split('\n').forEach((line, lineIndex) => {
       const lineSep = lineIndex === 0 ? blockSep : '\n'
       if (charLength(line) <= limit) {
-        units.push({ text: line, sep: lineSep })
+        add(line, lineSep)
         return
       }
       const chars = Array.from(line)
       for (let i = 0; i < chars.length; i += limit - 1) {
         const piece = chars.slice(i, i + limit - 1).join('')
-        units.push({ text: i + limit - 1 < chars.length ? `${piece}…` : piece, sep: i === 0 ? lineSep : '' })
+        add(i + limit - 1 < chars.length ? `${piece}…` : piece, i === 0 ? lineSep : '')
       }
     })
   })
   // 再按顺序装进一条条消息
   const parts: string[] = []
   let current = ''
+  let length = 0
+  let listLines = 0
   for (const unit of units) {
-    if (!current) {
-      current = unit.text
-    } else if (charLength(current) + charLength(unit.sep) + charLength(unit.text) <= limit) {
+    const sepLength = charLength(unit.sep)
+    if (current && fitsLimits(length + sepLength + unit.length, listLines + unit.listLines, limit, list)) {
       current += unit.sep + unit.text
-    } else {
-      parts.push(current)
-      current = unit.text
+      length += sepLength + unit.length
+      listLines += unit.listLines
+      continue
     }
+    if (current) parts.push(current)
+    current = unit.text
+    length = unit.length
+    listLines = unit.listLines
   }
   if (current) parts.push(current)
   return parts

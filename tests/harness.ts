@@ -221,6 +221,8 @@ export class FakeQQ {
   failSend = false
   /** 只让发往这些群的消息失败。 */
   failSendGroups = new Set<string>()
+  /** 模拟 QQ 内容审核：返回 true 的群消息被拒收（retcode 1200）。 */
+  refuseSend: ((text: string, groupId: string) => boolean) | null = null
   systemMsg: any = { join_requests: [], invited_requests: [] }
   private messageId = 0
 
@@ -279,7 +281,9 @@ export class FakeQQ {
       case 'send_private_msg': {
         const isGroup = action === 'send_group_msg'
         if (this.failSend || (isGroup && this.failSendGroups.has(String(params.group_id)))) return fail(1200)
-        this.sent.push({ kind: isGroup ? 'group' : 'private', target: String(isGroup ? params.group_id : params.user_id), ...flatten(params.message), raw: params.message })
+        const flat = flatten(params.message)
+        if (isGroup && this.refuseSend?.(flat.text, String(params.group_id))) return fail(1200)
+        this.sent.push({ kind: isGroup ? 'group' : 'private', target: String(isGroup ? params.group_id : params.user_id), ...flat, raw: params.message })
         return ok({ message_id: ++this.messageId })
       }
       case 'get_group_system_msg':
