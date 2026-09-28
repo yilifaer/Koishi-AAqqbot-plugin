@@ -1,8 +1,14 @@
 // 对 OneBot（LLBot）接口的薄封装。只用 adapter-onebot 6.9.4 里确实存在的方法（见交接文档 03 平台调研）。
 
-import { Bot, Context, Fragment, Universal } from 'koishi'
+import { Bot, Context, Fragment, Session, Universal } from 'koishi'
 import type { Member, Role } from './policy'
-import { normalizeId } from './util'
+import { normalizeId, sleep } from './util'
+
+/** 机器人发的任意两条消息之间至少隔这么久（DECISIONS 第 63 条）。 */
+export const SEND_GAP_MS = 2000
+
+/** 发消息的队列：所有实例共用，插件重启后新旧实例也不会同时发。lastSentAt 是上一条发完（成功、失败、超时都算）的时间。 */
+const sending = { lastSentAt: 0, queue: Promise.resolve() as Promise<unknown> }
 
 export interface PendingJoinRequest {
   flag: string
@@ -13,7 +19,7 @@ export interface PendingJoinRequest {
 }
 
 export class Platform {
-  constructor(private ctx: Context, private getBotId: () => string) {}
+  constructor(private ctx: Context, private getBotId: () => string, private sendGapMs = SEND_GAP_MS) {}
 
   /** 所有机器人账号（任何平台），永远不处置。 */
   allSelfIds(): Set<string> {
@@ -86,8 +92,40 @@ export class Platform {
     await bot.handleGuildMemberRequest(flag, approve, reason)
   }
 
-  async sendGroup(bot: Bot, groupId: string, content: Fragment) {
-    await bot.sendMessage(groupId, content)
+  /**
+   * 排队发消息：一条一条地发，上一条发完后至少隔 sendGapMs 再发下一条（DECISIONS 第 63 条）。
+   * ready 在真正发出之前调用（排队可能要等一会儿），返回 false 就不发了（例如这期间暂停了），结果是 false。
+   */
+  private paced(send: () => Promise<unknown>, ready?: () => boolean | Promise<boolean>): Promise<boolean> {
+    const run = async () => {
+      const wait = sending.lastSentAt + this.sendGapMs - Date.now()
+      if (wait > 0) await sleep(wait)
+      if (ready && !(await ready())) return false
+      try {
+        await send()
+        return true
+      } finally {
+        sending.lastSentAt = Date.now()
+      }
+    }
+    const result = sending.queue.then(run, run)
+    sending.queue = result.catch(() => {})
+    return result
+  }
+
+  /**
+   * 发到群里。content 可以是一个函数：轮到这一条、ready 也通过之后才生成内容（例如提醒里的截止时间按真正发出的时间算）。
+   * 返回 false 表示 ready 说不发了；发送失败时抛出错误（超时、拒收等）。
+   */
+  sendGroup(bot: Bot, groupId: string, content: Fragment | (() => Fragment), ready?: () => boolean | Promise<boolean>): Promise<boolean> {
+    return this.paced(() => bot.sendMessage(groupId, typeof content === 'function' ? content() : content), ready)
+  }
+
+  /**
+   * 回复命令（私聊或运维群）。不用 session.send：它会吞掉错误，看不出是不是被 QQ 拒收了。
+   */
+  reply(session: Session, content: Fragment): Promise<boolean> {
+    return this.paced(() => session.bot.sendMessage(session.channelId!, content, undefined, { session }))
   }
 
   /** 掉线期间积压的入群申请（LLBot 的 get_group_system_msg；字段名按 LLBot 实际返回解析）。 */

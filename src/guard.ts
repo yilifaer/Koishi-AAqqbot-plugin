@@ -11,6 +11,7 @@
 import { Bot, Context, Fragment, h, Logger, Session, Universal } from 'koishi'
 import { AaClient, ApiFailure, describeFailure, ManagedGroup, Verdict } from './aa'
 import { Config, Mode } from './config'
+import { classifySendError, describeSplit, HIDDEN_NAME, sendSplitting } from './delivery'
 import { Notifier } from './notifier'
 import { Platform } from './platform'
 import {
@@ -20,7 +21,7 @@ import { CardNote, extendModels, GroupState, isMode, Store, TrackedMember } from
 import { MODE_TEXT, reasonShort, rejectHint } from './texts'
 import {
   AbortedError, charLength, chunk, displayName, errorText, fillTemplate, formatDeadline, formatShortTime, isOneBotRefusal,
-  isOneBotTimeout, maskId, MAX_MESSAGE_CHARS, nextClockTime, normalizeId, normalizeIdList, ONEBOT_TIMEOUT_HINT, parseClock,
+  isOneBotTimeout, maskId, MAX_LIST_CHARS, nextClockTime, normalizeId, normalizeIdList, ONEBOT_TIMEOUT_HINT, parseClock,
   sleep, splitMessage, throwIfAborted,
 } from './util'
 
@@ -38,6 +39,8 @@ export interface GuardOptions {
   groupDelayMs?: number
   /** 一轮巡检跑满多久就停下，剩下的群接着巡检（测试用）。 */
   patrolSoftBudgetMs?: number
+  /** 机器人发的任意两条消息之间的间隔（默认 2 秒，DECISIONS 第 63 条）。 */
+  sendGapMs?: number
 }
 
 export interface ModeInfo {
@@ -157,7 +160,7 @@ export class Guard {
   constructor(private ctx: Context, public config: Config, private options: GuardOptions = {}) {
     this.logger = ctx.logger('aaqqbot')
     this.store = new Store(ctx, () => this.now())
-    this.platform = new Platform(ctx, () => this.config.botId)
+    this.platform = new Platform(ctx, () => this.config.botId, options.sendGapMs)
     this.aa = new AaClient(ctx, {
       baseUrl: config.aaBaseUrl,
       keyId: config.keyId.trim(),
@@ -334,7 +337,7 @@ export class Guard {
     await this.startStep('检查 adapter-onebot 设置', async () => this.checkOneBotConfig(this.pickBot()))
     await this.startStep('检查白名单', async () => {
       const bad = this.invalidWhitelist()
-      if (bad.length) this.notifier.push(`⚠ 白名单里有 ${bad.length} 条写得不对，没有生效：${bad.join('、')}（每一条只能填一个 QQ 号）`)
+      if (bad.length) this.notifier.push(badWhitelistText(bad))
     })
     await this.startStep('安排离开联盟的到期检查', () => this.scheduleFastKicks())
     await this.startStep('健康检查', () => this.checkHealth(true))
@@ -1068,18 +1071,45 @@ export class Guard {
       const base = this.options.kickDelayMs ?? 3000
       await this.pause(base + Math.random() * base, signal)
     }
-    if (result.kicked.length && this.config.kickAnnounce) {
-      const list = result.kicked.map((k) => k.name).join('、')
-      const text = fillTemplate(this.config.kickAnnounceTemplate, { list, url: this.bindUrl() })
-      for (const part of splitMessage(text)) {
+    if (result.kicked.length && this.config.kickAnnounce) await this.announceKicks(bot, groupId, result.kicked.map((k) => k.name), signal)
+  }
+
+  /**
+   * 移出公告：每条最多 20 个名字、约 800 字；被 QQ 拒收时拆小重发，单独一个名字还被拒就隐藏这个名字（DECISIONS 第 62 条）。
+   * 超时、其他失败不重发（超时的其实可能已经发出去了，K11）。
+   */
+  private async announceKicks(bot: Bot, groupId: string, names: string[], signal: AbortSignal) {
+    const url = this.bindUrl()
+    const render = (part: string[]) => fillTemplate(this.config.kickAnnounceTemplate, { list: part.join('、'), url })
+    const batches: string[][] = []
+    for (const name of names) {
+      const last = batches[batches.length - 1]
+      if (last && last.length < REMIND_CHUNK && charLength(render([...last, name])) <= MAX_LIST_CHARS) last.push(name)
+      else batches.push([name])
+    }
+    for (const batch of batches) {
+      const report = await sendSplitting(batch, async (part) => {
+        const text = render(part)
         try {
-          await this.platform.sendGroup(bot, groupId, h.text(part))
+          // 长名字的公告可能超过 1500 字：照旧分段
+          for (const piece of splitMessage(text)) {
+            if (!(await this.platform.sendGroup(bot, groupId, h.text(piece), () => !signal.aborted && !this.paused))) return 'skipped'
+          }
+          return 'sent'
         } catch (error) {
-          // 不重发：超时的其实可能已经发出去了（K11）
-          this.logger.warn('发送移出公告失败 群 %s：%s%s', groupId, errorText(error), isOneBotTimeout(error) ? TIMEOUT_SUFFIX : '')
-          break
+          const kind = classifySendError(error)
+          this.logger.warn('发送移出公告失败 群 %s：%s%s', groupId, errorText(error), kind === 'timeout' ? TIMEOUT_SUFFIX : '')
+          return kind
         }
-      }
+      }, {
+        hide: () => HIDDEN_NAME,
+        onLost: (part, _, why) => {
+          this.logger.warn('群 %s 的移出公告没有发出（%s），这些名字没公告：%s', groupId, why === 'skipped' ? '已经暂停' : why, part.join('、'))
+        },
+        onHidden: (name) => this.logger.warn('群 %s 的移出公告里「%s」被 QQ 拒收，已隐藏这个名字', groupId, name),
+      })
+      if (report.split) this.logger.warn('群 %s 的移出公告（%d 人）%s', groupId, batch.length, describeSplit(report))
+      if (!report.delivered) break
     }
   }
 
@@ -1341,12 +1371,14 @@ export class Guard {
       return
     }
     const fast = plan.writes && plan.fastRemind.some((r) => r.qq === qq)
+    let notReminded = false
     if (fast) {
-      await this.sendFastReminders(bot, groupId, info.effective, plan)
+      notReminded = !(await this.sendFastReminders(bot, groupId, info.effective, plan))
     } else if (plan.writes && plan.newDenies.length) {
-      await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')
+      notReminded = !(await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')).sent
     }
-    const action = fast ? '已不具备成员资格，已马上提醒'
+    const action = notReminded ? `${fast ? '已不具备成员资格，' : ''}提醒没有发出去（没有定截止时间，不会因此被移出）`
+      : fast ? '已不具备成员资格，已马上提醒'
       : plan.writes ? '已开始宽限并提醒'
       : plan.breaker === 'trip' ? '这个群进入冷静期，只记录'
         : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
@@ -1580,9 +1612,9 @@ export class Guard {
   }
 
   /**
-   * 在群里 @ 提醒（每条最多 20 人，文字太长时再对半拆，每条不超过 1500 字）。
-   * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（现在 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒。
-   * 发送失败不重发（超时的其实可能已经发出去了），也不记提醒时间：没收到提醒的人不会被移出。
+   * 在群里 @ 提醒（每条最多 20 人、约 800 字，DECISIONS 第 62 条）。
+   * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（发出时间 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒。
+   * 被 QQ 拒收就对半拆开重发；超时、其他失败不重发（超时的其实可能已经发出去了），也不记提醒时间：没收到提醒的人不会被移出。
    */
   async sendReminder(bot: Bot, groupId: string, mode: Mode, rows: TrackedMember[], source: 'daily' | 'newcomer' | 'fast' = 'daily', staff = false):
     Promise<{ sent: number; failed: number; timedOut: boolean; reminded: TrackedMember[] }> {
@@ -1614,12 +1646,12 @@ export class Guard {
     }
     const estimate = (part: TrackedMember[]) => charLength(head) + charLength(tail)
       + part.reduce((sum, row) => sum + AT_CHARS + charLength(entryText(row, this.now())), 0)
-    // 每批最多 20 人；一条消息估算超过上限就再对半拆
+    // 每批最多 20 人；一条消息估算超过约 800 字就再对半拆（名单分短，DECISIONS 第 62 条）
     const queue = chunk(rows, REMIND_CHUNK)
     const batches: TrackedMember[][] = []
     while (queue.length) {
       const part = queue.shift()!
-      if (part.length > 1 && estimate(part) > MAX_MESSAGE_CHARS) {
+      if (part.length > 1 && estimate(part) > MAX_LIST_CHARS) {
         const mid = Math.ceil(part.length / 2)
         queue.unshift(part.slice(0, mid), part.slice(mid))
         continue
@@ -1627,26 +1659,55 @@ export class Guard {
       batches.push(part)
     }
     const what = source === 'daily' ? '每日提醒' : source === 'fast' ? '离开联盟提醒' : '新人提醒'
-    for (const part of batches) {
-      if (!(await this.stillWritable(groupId, this.signal))) break
-      const now = this.now()
-      const updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
-      const content: Fragment[] = [h.text(head)]
-      for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
-      if (tail) content.push(h.text(tail))
-      try {
-        await this.platform.sendGroup(bot, groupId, content as any)
-      } catch (error) {
-        outcome.failed += part.length
-        if (isOneBotTimeout(error)) outcome.timedOut = true
-        this.logger.warn('发送提醒失败 群 %s：%s%s', groupId, errorText(error), isOneBotTimeout(error) ? TIMEOUT_SUFFIX : '')
-        continue
-      }
-      await this.store.markReminded(groupId, updated)
-      outcome.sent += part.length
-      outcome.reminded.push(...updated)
-      this.logger.info('已在群 %s 提醒 %d 人（%s）', groupId, part.length, what)
-      await this.store.audit('remind', groupId, '', `${part.length} 人（${what}）`)
+    let stopped = false
+    for (const batch of batches) {
+      if (stopped) break
+      let delivered = 0
+      let skipped = 0
+      // 被 QQ 拒收就对半拆开重发，只剩 1 人还被拒就算没提醒到（他不会因此被移出）
+      const report = await sendSplitting(batch, async (part) => {
+        if (stopped) {
+          skipped += part.length
+          return 'skipped'
+        }
+        // 轮到这一条时才生成内容：截止时间、提醒时间按真正发出的时间算（排队可能要等一会儿）
+        let updated: TrackedMember[] = []
+        const build = () => {
+          const now = this.now()
+          updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
+          const content: Fragment[] = [h.text(head)]
+          for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
+          if (tail) content.push(h.text(tail))
+          return content as any
+        }
+        try {
+          // 排队等发的这段时间里可能暂停了或进入了冷静期：发之前再确认一次
+          if (!(await this.platform.sendGroup(bot, groupId, build, () => this.stillWritable(groupId, this.signal)))) {
+            stopped = true
+            skipped += part.length
+            return 'skipped'
+          }
+        } catch (error) {
+          const kind = classifySendError(error)
+          if (kind === 'timeout') outcome.timedOut = true
+          this.logger.warn('发送提醒失败 群 %s：%s%s', groupId, errorText(error), kind === 'timeout' ? TIMEOUT_SUFFIX : '')
+          return kind
+        }
+        await this.store.markReminded(groupId, updated)
+        delivered += part.length
+        outcome.reminded.push(...updated)
+        this.logger.info('已在群 %s 提醒 %d 人（%s）', groupId, part.length, what)
+        await this.store.audit('remind', groupId, '', `${part.length} 人（${what}）`)
+        return 'sent'
+      }, {
+        onLost: (part, _, why) => {
+          const reason = why === 'refused' ? '被 QQ 拒收，单独 @ 也发不出去' : why === 'skipped' ? '轮到时已经暂停或不能再发' : '发送失败'
+          this.logger.warn('群 %s 的%s没有发出（%s），这些人没提醒到：%s', groupId, what, reason, part.map((row) => maskId(row.qq)).join('、'))
+        },
+      })
+      outcome.sent += delivered
+      outcome.failed += batch.length - delivered - skipped
+      if (report.split) this.logger.warn('群 %s 的%s（%d 人）%s', groupId, what, batch.length, describeSplit(report))
     }
     return outcome
   }
@@ -1654,8 +1715,8 @@ export class Guard {
   // ------------------------------------------------------------ 离开联盟：马上提醒、到点移出（DECISIONS 第 52 条）
 
   /** 这一轮发现的「离开联盟」的人马上提醒，运维群每人一行 ⚡，然后重新安排到期检查。 */
-  private async sendFastReminders(bot: Bot, groupId: string, mode: Mode, plan: Plan) {
-    if (!plan.writes || !plan.fastRemind.length) return
+  private async sendFastReminders(bot: Bot, groupId: string, mode: Mode, plan: Plan): Promise<number> {
+    if (!plan.writes || !plan.fastRemind.length) return 0
     const result = await this.sendReminder(bot, groupId, mode, plan.fastRemind, 'fast')
     const label = this.groupLabel(groupId)
     const roster = this.rosters.get(groupId)
@@ -1669,6 +1730,7 @@ export class Guard {
       this.notifier.push(`⚠ ${label} 离开联盟的提醒没有发出去（${result.failed} 人），没有定截止时间，下一次复查或巡检时再试${result.timedOut ? '；LLBot 响应超时，群里可能其实已经看到了' : ''}`)
     }
     await this.scheduleFastKicks()
+    return result.reminded.length
   }
 
   /** 按最早的一个「离开联盟」截止时间安排到期检查（插件启动、定下截止时间、解除暂停时调用）。 */
@@ -1815,7 +1877,7 @@ export class Guard {
     lines.push(`AA：${this.aaDown ? '❌ 最近一次请求失败' : '正常'}${this.aa.clockSkewMs !== null ? `（时间差 ${Math.round(this.aa.clockSkewMs / 1000)} 秒）` : ''}`)
     if (this.adminGroupConflict) lines.push('❌ 运维群同时是受管群，已停止发送运维通知，请修改配置')
     const badWhitelist = this.invalidWhitelist()
-    if (badWhitelist.length) lines.push(`⚠ 白名单里有 ${badWhitelist.length} 条写得不对，没有生效：${badWhitelist.join('、')}`)
+    if (badWhitelist.length) lines.push(badWhitelistText(badWhitelist))
     if (this.lastRound) lines.push(`上次巡检：${formatShortTime(this.lastRound.at)}${this.lastRound.ok ? '' : '（有问题）'}`)
     if (this.patrolRunning) lines.push('正在巡检中')
     else if (this.nextPatrolAt) lines.push(`下次巡检：${formatShortTime(this.nextPatrolAt)}`)
@@ -1874,6 +1936,11 @@ export class Guard {
     this.lastPrune = now
     await this.store.pruneAudit(new Date(now - AUDIT_KEEP_MS))
   }
+}
+
+/** 白名单里写得不对的条目：一条一行（名单分短、被拒时拆开都按行来，DECISIONS 第 62 条）。 */
+function badWhitelistText(bad: string[]): string {
+  return [`⚠ 白名单里有 ${bad.length} 条写得不对，没有生效（每一条只能填一个 QQ 号）：`, ...bad.map((entry) => `· ${entry}`)].join('\n')
 }
 
 /** 名片记录里被 QQ 拒过的：QQ → 那张 AA 名片（同一张不再重试）。 */

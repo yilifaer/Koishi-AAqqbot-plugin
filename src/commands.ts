@@ -3,38 +3,74 @@
 // 在其他任何群（包括受管群）里发命令，一律不回应。
 
 import { Argv, Context, h, Session } from 'koishi'
+import { classifySendError, describeSplit, hideNames, renderLines, sendSplitting, textLines } from './delivery'
 import type { Guard } from './guard'
-import { normalizeId, splitMessage } from './util'
+import { MAX_LIST_CHARS, MAX_LIST_LINES, MAX_MESSAGE_CHARS, normalizeId, splitMessage } from './util'
 
 /** 一次命令回复最多发几条（DECISIONS 第 43 条）。 */
 export const MAX_REPLY_PARTS = 5
 
+/** 不在运维名单里的人发命令：同一个人这么久之内只回一次（不然有人刷屏会把机器人发消息的队列堵住）。 */
+const DENY_REPLY_EVERY_MS = 3600_000
+
 export function registerCommands(ctx: Context, guard: Guard) {
-  const gate = ({ session }: Argv) => {
+  const deniedAt = new Map<string, number>()
+  const gate = async ({ session }: Argv) => {
     if (!session || session.platform !== 'onebot') return ''
     const admin = guard.adminGroup()
     const inPrivate = session.isDirect
     const inAdminGroup = !session.isDirect && !!admin && normalizeId(session.guildId) === admin
     if (!inPrivate && !inAdminGroup) return '' // 不回应
     const qq = normalizeId(session.userId)
-    if (!qq || !guard.operators().has(qq)) return h.text('你不在运维名单里，不能使用这个命令。')
+    if (!qq || !guard.operators().has(qq)) {
+      const now = Date.now()
+      if (qq && now - (deniedAt.get(qq) ?? 0) < DENY_REPLY_EVERY_MS) return ''
+      if (deniedAt.size > 1000) deniedAt.clear()
+      if (qq) deniedAt.set(qq, now)
+      await send(session, '你不在运维名单里，不能使用这个命令。')
+      return ''
+    }
     // 返回 undefined 表示继续，接下来由 Koishi 检查权限等级（authority: 3）
   }
 
   /**
-   * 回复一段文字：超过 1500 字就分成几条发（带（1/N）序号），最多 5 条；
+   * 发出一条回复：和机器人发的其他消息一起排队、相互隔 2 秒（DECISIONS 第 63 条）；
+   * 被 QQ 拒收时对半拆开重发，单独一行还被拒才隐藏名字（DECISIONS 第 62 条）。
+   */
+  const send = async (session: Session, text: string) => {
+    const { label, lines } = textLines(text)
+    if (!lines.length) return
+    const report = await sendSplitting(lines, async (part, sub) => {
+      try {
+        await guard.platform.reply(session, h.text(renderLines(part, sub)))
+        return 'sent'
+      } catch (error) {
+        guard.logger.warn('命令回复发送失败：%s', error)
+        return classifySendError(error)
+      }
+    }, {
+      label,
+      hide: hideNames,
+      onLost: (part, sub) => guard.logger.warn('命令回复（%s）没有发出，只写日志：%s', sub || '1/1', renderLines(part, '').replace(/\n+/g, ' | ')),
+    })
+    if (report.split) guard.logger.warn('命令回复%s%s', label ? `（${label}）` : '', describeSplit(report))
+  }
+
+  /**
+   * 回复一段文字：超过 1500 字（或名单超过 20 行、约 800 字）就分成几条发（带（1/N）序号），最多 5 条；
    * 更长的只发前 4 条，第 5 条说明其余见日志，完整内容写进 Koishi 日志。
+   * 由插件自己发（返回空字符串，Koishi 就不再发），这样才看得出有没有被 QQ 拒收。
    */
   const reply = async (session: Session | undefined, text: string) => {
-    const parts = splitMessage(text)
-    if (parts.length === 1 || !session) return h.text(parts.join('\n'))
+    const parts = splitMessage(text, MAX_MESSAGE_CHARS, { lines: MAX_LIST_LINES, chars: MAX_LIST_CHARS })
+    if (!session) return h.text(parts.join('\n'))
     let shown = parts
     if (parts.length > MAX_REPLY_PARTS) {
       guard.logger.info('命令回复太长，完整内容：\n%s', text)
       shown = [...parts.slice(0, MAX_REPLY_PARTS - 1), '……内容太长，其余见 Koishi 日志']
     }
-    for (const part of shown.slice(0, -1)) await session.send(h.text(part))
-    return h.text(shown[shown.length - 1])
+    for (const part of shown) await send(session, part)
+    return ''
   }
 
   const define = (decl: string, description: string) =>
