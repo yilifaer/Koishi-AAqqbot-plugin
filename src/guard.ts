@@ -763,7 +763,7 @@ export class Guard {
       await this.store.audit('cool-start', groupId, '', plan.breakerReason)
       this.notifier.push([
         `⏸ 冷静期开始：${label} ${plan.breakerReason}。`,
-        '可能是 AA 设置被改错了。这个群先停止处置（不提醒、不加标记、不改名片、不移出、不拒绝申请），名单见巡检报告。',
+        '可能是 AA 设置被改错了。这个群先停止提醒、移出和拒绝申请（名片照常改：不合格的加标记，合格的按 AA 改），名单见巡检报告。',
         `${formatShortTime(now + this.cooldownMs())} 之后的第一次巡检：还是这批人就自动继续，变化很大就重新冷静。`,
         '如果是 AA 改错了，请在那之前改回来；要马上停止一切操作，发送 aaqq.pause。',
       ].join('\n'))
@@ -972,7 +972,8 @@ export class Guard {
     const cards = plan.cards.slice(0, MAX_CARDS_PER_ROUND)
     result.cardsDeferred = plan.cards.length - cards.length
     for (const [index, change] of cards.entries()) {
-      if (!(await this.stillWritable(groupId, signal))) {
+      // 冷静中也照常改名片（DECISIONS 第 64 条）；暂停、中止时停下
+      if (signal.aborted || this.paused) {
         result.cardsDeferred += cards.length - index
         break
       }

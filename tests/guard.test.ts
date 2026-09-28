@@ -375,10 +375,12 @@ describe('冷静期（K3）', () => {
     await env.guard.runPatrol()
   }
 
-  it('全员变 deny → 冷静期开始；1 小时后仍冷静；满 6 小时还是这批人 → 自动结束、开始加标记', async () => {
+  it('全员变 deny → 冷静期开始（名片照常加标记，不提醒）；1 小时后仍冷静；满 6 小时还是这批人 → 自动结束、开始处置', async () => {
     env = await setup()
     await massDeny('remind')
-    expect(spyCards()).toEqual([])
+    expect(spyCards()).toHaveLength(8) // 冷静期里名片照常改（DECISIONS 第 64 条）
+    expect(env.qq.groupMessages(GROUP)).toEqual([])
+    expect([...(await env.guard.store.tracked(GROUP)).values()].some((r) => r.activeSince)).toBe(false)
     const state = await env.guard.store.groupState(GROUP)
     expect(state.holdSince).not.toBeNull()
     expect(JSON.parse(state.holdSet).sort()).toEqual(EIGHT)
@@ -390,7 +392,7 @@ describe('冷静期（K3）', () => {
 
     env.clock.now += HOUR
     await env.guard.runPatrol()
-    expect(spyCards()).toEqual([])
+    expect(spyCards()).toHaveLength(8) // 已经有标记，不重复改
     const cooling = (await env.adminMessages()).at(-1)!
     expect(cooling).toContain('⏸ 冷静中（要开始处置的不合格成员有 8 人（超过阈值 1 人））')
     expect(cooling).toContain('仍不合格 8 人')
@@ -419,7 +421,8 @@ describe('冷静期（K3）', () => {
     await env.guard.runPatrol()
     expect((await env.guard.store.groupState(GROUP)).holdSince).toBeNull()
     expect((await env.adminMessages()).join('\n')).toContain(`▶ 冷静期结束：${LABEL} 已恢复正常。`)
-    expect(spyCards()).toEqual([])
+    // 冷静中加上的标记，AA 改回来后（冷静中的局部复查就已经）改回 AA 的名片
+    for (const qq of EIGHT) expect(env.qq.member(GROUP, qq)!.card).toBe(`[IGC] ${qq}`)
     expect(await env.guard.store.tracked(GROUP)).toEqual(new Map())
   })
 
@@ -438,7 +441,7 @@ describe('冷静期（K3）', () => {
     expect(env.qq.groupMessages(GROUP)).toEqual([])
   })
 
-  it('冷静满 6 小时后多了很多人 → 冷静期重新开始，仍不加标记', async () => {
+  it('冷静满 6 小时后多了很多人 → 冷静期重新开始（名片照常加标记，不提醒）', async () => {
     env = await setup()
     addMembers(...EIGHT)
     for (const qq of EIGHT) env.aa.allow(qq, `[IGC] ${qq}`)
@@ -449,7 +452,8 @@ describe('冷静期（K3）', () => {
     env.clock.now += 6 * HOUR
     for (const qq of EIGHT) env.aa.deny(qq, 'NO_ACCESS') // 又多了 5 人
     await env.guard.runPatrol()
-    expect(spyCards()).toEqual([])
+    expect(spyCards()).toHaveLength(8)
+    expect(env.qq.groupMessages(GROUP)).toEqual([])
     const state = await env.guard.store.groupState(GROUP)
     expect(state.holdSince!.getTime()).toBe(env.clock.now)
     expect(JSON.parse(state.holdSet)).toHaveLength(8)
@@ -480,7 +484,8 @@ describe('冷静期（K3）', () => {
     for (const qq of EIGHT) env.aa.deny(qq) // 之后又多了 6 人
     await env.guard.runPatrol([GROUP])
     expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
-    expect(spyCards()).toEqual([])
+    expect(spyCards()).toHaveLength(8)
+    expect(env.qq.groupMessages(GROUP)).toEqual([])
     expect((await env.adminMessages()).join('\n')).toContain('冷静期重新开始')
   })
 
@@ -512,7 +517,8 @@ describe('冷静期（K3）', () => {
         expect(state.holdSince!.getTime()).toBe(env.clock.now)
         expect(JSON.parse(state.holdSet).sort()).toEqual(EIGHT)
         expect((await env.adminMessages()).join('\n')).toContain('升级前留下的熔断没有记下名单，现在记下这 8 人')
-        expect(spyCards()).toEqual([])
+        expect(spyCards()).toHaveLength(8)
+        expect(env.qq.groupMessages(GROUP)).toEqual([])
       } else {
         expect(state.holdSince).toBeNull()
         expect((await env.adminMessages()).join('\n')).toContain('已恢复正常')
@@ -522,13 +528,15 @@ describe('冷静期（K3）', () => {
     env = await setup() // afterEach 要一个没停的环境
   })
 
-  it('report 群里已知 3 个不合格（阈值 1），改成 remind：先冷静，满时间后才加标记（Q1）', async () => {
+  it('report 群里已知 3 个不合格（阈值 1），改成 remind：先冷静（名片照常加标记），满时间后才开始处置（Q1）', async () => {
     env = await setup()
     addMembers('40001', '40002', '40003')
     await env.guard.runPatrol() // report：只记录
     setMode('remind')
     await env.guard.runPatrol()
-    expect(spyCards()).toEqual([])
+    expect(spyCards()).toHaveLength(3)
+    await env.guard.runReminders()
+    expect(env.qq.groupMessages(GROUP)).toEqual([])
     expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
     expect((await env.adminMessages()).join('\n')).toContain('要开始处置的不合格成员有 3 人（超过阈值 1 人）')
     env.clock.now += 6 * HOUR
@@ -561,10 +569,10 @@ describe('冷静期（K3）', () => {
     await enableMode('enforce')
     expect(env.qq.member(GROUP, '40001')!.card).toBe('[IGC] 40001')
 
-    // AA 被改错：全员 NO_ACCESS → 第一次冷静
+    // AA 被改错：全员 NO_ACCESS → 第一次冷静（名片照常加标记，不提醒、不移出）
     for (const qq of people) env.aa.deny(qq, 'NO_ACCESS')
     await env.guard.runPatrol()
-    expect(spyCards()).toEqual([])
+    expect(spyCards()).toHaveLength(10)
     expect(env.qq.groupMessages(GROUP)).toEqual([])
     expect(env.qq.actions('set_group_kick')).toEqual([])
 
@@ -812,7 +820,8 @@ describe('AA 变化（事件）', () => {
     for (const qq of ['40001', '40002', '40003']) env.aa.deny(qq, 'NO_ACCESS')
     env.aa.events = [{ id: 1, kind: 'recheck', qq: '40001' }, { id: 2, kind: 'recheck', qq: '40002' }, { id: 3, kind: 'recheck', qq: '40003' }]
     await env.guard.pollEvents()
-    expect(env.qq.member(GROUP, '40001')!.card).toBe('[IGC] 40001')
+    expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】[IGC] 40001') // 名片照常加标记
+    expect(env.qq.groupMessages(GROUP)).toEqual([]) // 但不提醒
     const state = await env.guard.store.groupState(GROUP)
     expect(state.holdSince).not.toBeNull()
     expect(JSON.parse(state.holdSet).sort()).toEqual(['40001', '40002', '40003'])
@@ -1875,21 +1884,26 @@ describe('刚启动、还没巡检过这个群时有新人入群（0.2.3 R3）',
     expect((await env.adminMessages()).join('\n')).not.toContain('冷静期开始')
   })
 
-  it('真的超过阈值：最近处置过 5 人，再来 1 个 → 进入冷静期，新人只记录', async () => {
+  it('真的超过阈值：最近处置过 5 人，再来 1 个 → 进入冷静期，新人加标记但不提醒', async () => {
     await restartedGroup(5)
+    const before = env.qq.groupMessages(GROUP).length
     await env.guard.handleNewMember(env.bot as any, GROUP, '50001')
     expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
-    expect(marked('50001')).toBe(false)
+    expect(marked('50001')).toBe(true)
+    expect(env.qq.groupMessages(GROUP).slice(before)).toEqual([])
     expect((await env.adminMessages()).join('\n')).toContain('⏸ 冷静期开始：联盟聊天群（111111111） 最近 6 小时内要开始处置的不合格成员有 6 人（这一轮 1 人、之前 5 人，超过阈值 5 人）')
   })
 
-  it('取不到群人数：不据此进入冷静期，新人这一轮只记录', async () => {
+  it('取不到群人数：不据此进入冷静期，新人这一轮不提醒（名片照常加标记）', async () => {
     await restartedGroup(5)
     env.qq.timeoutActions.add('get_group_member_list')
+    const before = env.qq.groupMessages(GROUP).length
     await env.guard.handleNewMember(env.bot as any, GROUP, '50001')
     env.qq.timeoutActions.clear()
     expect((await env.guard.store.groupState(GROUP)).holdSince).toBeNull()
-    expect(marked('50001')).toBe(false)
+    expect(marked('50001')).toBe(true)
+    expect(env.qq.groupMessages(GROUP).slice(before)).toEqual([])
+    expect((await env.guard.store.tracked(GROUP)).get('50001')!.activeSince).toBeNull()
     expect((await env.guard.store.tracked(GROUP)).has('50001')).toBe(true)
   })
 })
@@ -2501,6 +2515,11 @@ describe('数据迁移（0.1.x → 0.2.0）', () => {
 describe('0.2.1 修补', () => {
   const spyCards = () => env.qq.actions('set_group_card').filter((c) => String(c.params.card).startsWith('【SPY】'))
   const marked = (qq: string) => env.qq.member(GROUP, qq)!.card.startsWith('【SPY】')
+  /** 这些人里已经开始处置（activeSince 有值）的人数。 */
+  const started = async (qqs: string[]) => {
+    const rows = await env.guard.store.tracked(GROUP)
+    return qqs.filter((qq) => rows.get(qq)?.activeSince).length
+  }
   let eventId = 0
 
   /** AA 上这些人变成不合格，并发出对应的事件，然后拉一次变化。 */
@@ -2524,17 +2543,19 @@ describe('0.2.1 修补', () => {
     return people
   }
 
-  it('P1 分批到达：3、3、3 人陆续变成不合格 → 第 2 批时进入冷静期，这 3 人不加标记；第 3 批仍在冷静中', async () => {
+  it('P1 分批到达：3、3、3 人陆续变成不合格 → 第 2 批时进入冷静期，这 3 人不开始处置（只加标记）；第 3 批仍在冷静中', async () => {
     const people = await thresholdFiveGroup()
     await denyByEvents(people.slice(0, 3))
     expect(people.slice(0, 3).every(marked)).toBe(true)
+    expect(await started(people.slice(0, 3))).toBe(3)
     await denyByEvents(people.slice(3, 6))
-    expect(people.slice(3, 6).some(marked)).toBe(false)
+    expect(people.slice(3, 6).every(marked)).toBe(true)
+    expect(await started(people.slice(3, 6))).toBe(0)
     const state = await env.guard.store.groupState(GROUP)
     expect(state.holdSince).not.toBeNull()
     expect(JSON.parse(state.holdSet).sort()).toEqual(people.slice(0, 6))
     await denyByEvents(people.slice(6, 9))
-    expect(people.slice(6, 9).some(marked)).toBe(false)
+    expect(await started(people.slice(6, 9))).toBe(0)
     const messages = (await env.adminMessages()).join('\n')
     expect(messages).toContain('⏸ 冷静期开始：联盟聊天群（111111111） 最近 6 小时内要开始处置的不合格成员有 6 人（这一轮 3 人、之前 3 人，超过阈值 5 人）')
   })
@@ -2565,9 +2586,9 @@ describe('0.2.1 修补', () => {
     env.clock.now += 15 * 60_000 // 第 1 批处置已经过去 6 小时 5 分钟
     await env.guard.runPatrol()
     expect((await env.guard.store.groupState(GROUP)).holdSince!.getTime()).toBe(since)
-    expect(people.slice(3, 6).some(marked)).toBe(false)
+    expect(await started(people.slice(3, 6))).toBe(0)
     await denyByEvents(people.slice(6, 11)) // 冷静中再来 5 人：仍然不处置
-    expect(people.slice(6, 11).some(marked)).toBe(false)
+    expect(await started(people.slice(6, 11))).toBe(0)
     const messages = (await env.adminMessages()).join('\n')
     expect(messages).not.toContain('冷静期结束')
   })
