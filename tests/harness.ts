@@ -212,6 +212,12 @@ export class FakeQQ {
   sent: SentMessage[] = []
   requests: Array<{ flag: string; approve: boolean; reason: string }> = []
   failKick = new Set<string>()
+  /** 这些人的名片 QQ 拒绝修改（机器人身份够，但 QQ 还是拒绝了）。 */
+  failCard = new Set<string>()
+  /** 这些接口一律超时（adapter-onebot 抛 TimeoutError）。 */
+  timeoutActions = new Set<string>()
+  /** 每次调用 set_group_card 之前调用（测试里可以在这里暂停插件）。 */
+  beforeCard: ((qq: string) => void) | null = null
   failSend = false
   /** 只让发往这些群的消息失败。 */
   failSendGroups = new Set<string>()
@@ -236,6 +242,7 @@ export class FakeQQ {
 
   handle(action: string, params: any): { retcode: number; data: any; status?: string } {
     this.calls.push({ action, params: JSON.parse(JSON.stringify(params ?? {})) })
+    if (this.timeoutActions.has(action)) throw new OneBot.TimeoutError(params, action)
     const ok = (data: any = null) => ({ status: 'ok', retcode: 0, data })
     const fail = (retcode = 1200) => ({ status: 'failed', retcode, data: null })
     const group = this.groups.get(String(params?.group_id))
@@ -255,8 +262,13 @@ export class FakeQQ {
         return ok()
       }
       case 'set_group_card': {
+        this.beforeCard?.(String(params.user_id))
         const m = group?.get(String(params.user_id))
         if (!m) return fail(1200)
+        // QQ 的规矩：群主能改管理员和普通成员；管理员只能改普通成员
+        const self = group!.get(BOT)
+        if (self?.role === 'member' || (m.role !== 'member' && self?.role !== 'owner')) return fail(102)
+        if (this.failCard.has(String(params.user_id))) return fail(102)
         m.card = params.card
         return ok()
       }
@@ -364,6 +376,7 @@ export async function setup(configPatch: Partial<Config> = {}, options: { start?
     breakerCount: 5,
     breakerPercent: 10,
     kickPerHour: 10,
+    breakerCooldownHours: 6,
     ...configPatch,
   }
 
