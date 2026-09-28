@@ -2,7 +2,8 @@
 //
 // 安全规则（交接文档 R5–R11、API.md 第 1.1 / 7.1 节）：
 // - 拿不到 AA 的明确答案就什么都不做；review 永不处置。
-// - 群主、管理员、机器人、白名单永不提醒、永不加标记、永不移出；移出前实时复核。
+// - 群主、管理员永不移出（不合格时默认也加标记、单独提醒，DECISIONS 第 51 条）；
+//   机器人、QQ 官方机器人、白名单永不提醒、永不加标记、永不移出。加标记、移出前都实时复核。
 // - 改模式下一轮巡检直接生效；一轮里要开始处置的人太多时，这个群先进入冷静期（只报告、报警），
 //   到时间后还是那批人就自动继续，变化大就重新冷静（DECISIONS 第 38、39 条）。
 // - 暂停、停用插件、改配置都会立即中止正在进行的一轮。
@@ -13,7 +14,7 @@ import { Config, Mode } from './config'
 import { Notifier } from './notifier'
 import { Platform } from './platform'
 import {
-  botCanWrite, canEditCard, Cooling, emptyPlan, isProtected, Member, Plan, planGroup, planRelease, PlanSettings, Role,
+  botCanWrite, canEditCard, Cooling, emptyPlan, isExempt, isProtected, Member, Plan, planGroup, planRelease, PlanSettings, Role,
 } from './policy'
 import { CardNote, extendModels, GroupState, isMode, Store, TrackedMember } from './store'
 import { MODE_TEXT, reasonShort, rejectHint } from './texts'
@@ -791,6 +792,7 @@ export class Guard {
       markPrefix: this.config.markPrefix ?? '',
       allowKicks,
       cooldownMs: this.cooldownMs(),
+      markAdmins: this.config.markAdmins ?? true,
     }
   }
 
@@ -837,7 +839,9 @@ export class Guard {
     if (applied.kicked.length) {
       result.push(listSection(`已移出 ${applied.kicked.length} 人`, applied.kicked.map((k) => ({ text: `${k.name}(${k.qq})` }))))
     }
-    const byReason = (items: Array<{ qq: string; reason: string }>) => items.map((x) => ({ text: who(x.qq), group: reasonShort(x.reason) }))
+    const staffTag = (staff?: string) => (staff === 'owner' ? '（群主，不移出）' : staff === 'admin' ? '（管理员，不移出）' : '')
+    const byReason = (items: Array<{ qq: string; reason: string; staff?: string }>) =>
+      items.map((x) => ({ text: `${who(x.qq)}${staffTag(x.staff)}`, group: reasonShort(x.reason) }))
     if (plan.newDenies.length) result.push(listSection(`新发现不合格 ${plan.newDenies.length} 人`, byReason(plan.newDenies)))
     const old = plan.denies.filter((d) => !d.isNew)
     if (old.length) result.push(listSection(`仍不合格 ${old.length} 人`, byReason(old)))
@@ -937,7 +941,7 @@ export class Guard {
       if (change.why === 'mark') {
         // 加标记前实时复核（和移出一样）：刚被设为管理员、已经退群的人不加（DECISIONS 第 49 条）
         const live = await this.platform.getMember(bot, groupId, change.qq)
-        if (!live || isProtected(live, this.protectedIds())) {
+        if (!live || isExempt(live, this.protectedIds(), this.config.markAdmins ?? true)) {
           result.markSkipped++
           this.logger.info('加标记前复核：群 %s 成员 %s 已经不是普通成员或不在群里，不加标记', groupId, maskId(change.qq))
           continue
@@ -1490,7 +1494,12 @@ export class Guard {
         })
         await this.applyPlan(bot, g.groupId, plan, this.signal)
         if (!plan.writes) continue
-        const sent = await this.sendReminder(bot, g.groupId, info.effective, plan.track.filter((r) => r.activeSince), 'daily')
+        // 群主 / 管理员单独一条提醒（没有截止时间，DECISIONS 第 51 条）
+        const staff = new Set(plan.denies.filter((d) => d.staff).map((d) => d.qq))
+        const rows = plan.track.filter((r) => r.activeSince)
+        const normal = await this.sendReminder(bot, g.groupId, info.effective, rows.filter((r) => !staff.has(r.qq)), 'daily')
+        const admins = await this.sendReminder(bot, g.groupId, info.effective, rows.filter((r) => staff.has(r.qq)), 'daily', true)
+        const sent = { sent: normal.sent + admins.sent, failed: normal.failed + admins.failed, timedOut: normal.timedOut || admins.timedOut }
         const label = this.groupLabel(g.groupId)
         if (sent.sent) this.notifier.push(`⏰ ${label} 已提醒 ${sent.sent} 人`)
         if (sent.failed) {
@@ -1507,17 +1516,20 @@ export class Guard {
    * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（现在 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒。
    * 发送失败不重发（超时的其实可能已经发出去了），也不记提醒时间：没收到提醒的人不会被移出。
    */
-  async sendReminder(bot: Bot, groupId: string, mode: Mode, rows: TrackedMember[], source: 'daily' | 'newcomer' = 'daily'):
+  async sendReminder(bot: Bot, groupId: string, mode: Mode, rows: TrackedMember[], source: 'daily' | 'newcomer' = 'daily', staff = false):
     Promise<{ sent: number; failed: number; timedOut: boolean }> {
     const outcome = { sent: 0, failed: 0, timedOut: false }
     if (!rows.length) return outcome
-    const template = mode === 'enforce' ? this.config.warnTemplate : this.config.remindTemplate
+    // 群主 / 管理员：单独的文字，没有截止时间（永远不移出）
+    const withDeadline = mode === 'enforce' && !staff
+    const template = staff ? (this.config.adminRemindTemplate ?? this.config.remindTemplate)
+      : mode === 'enforce' ? this.config.warnTemplate : this.config.remindTemplate
     const url = this.bindUrl()
     const [beforeList, ...rest] = template.split('{list}')
     const head = fillTemplate(beforeList, { url })
     const tail = rest.length ? fillTemplate(rest.join('{list}'), { url }) : ''
     const entryText = (row: TrackedMember, now: number) => {
-      const graceUntil = mode === 'enforce' ? row.graceUntil ?? new Date(now + this.config.graceHours * 3600_000) : null
+      const graceUntil = withDeadline ? row.graceUntil ?? new Date(now + this.config.graceHours * 3600_000) : null
       return `（${reasonShort(row.reason)}${graceUntil ? `，截止 ${formatDeadline(graceUntil.getTime())}` : ''}）\n`
     }
     const estimate = (part: TrackedMember[]) => charLength(head) + charLength(tail)
@@ -1540,7 +1552,7 @@ export class Guard {
       const now = this.now()
       const updated = part.map((row) => ({
         ...row,
-        graceUntil: mode === 'enforce' ? row.graceUntil ?? new Date(now + this.config.graceHours * 3600_000) : null,
+        graceUntil: withDeadline ? row.graceUntil ?? new Date(now + this.config.graceHours * 3600_000) : null,
         lastRemindedAt: new Date(now),
       }))
       const content: Fragment[] = [h.text(head)]

@@ -369,6 +369,8 @@ export async function setup(configPatch: Partial<Config> = {}, options: { start?
     remindTime: '19:30',
     remindTemplate: '以下成员还没有满足本群的要求，请尽快在联盟 AA 完成 QQ 绑定：{url}\n{list}',
     warnTemplate: '以下成员还没有满足本群的要求，请在截止时间前完成绑定，否则会被移出本群：{url}\n{list}',
+    markAdmins: true,
+    adminRemindTemplate: '以下群主/管理员还没有满足本群的要求（不会被移出），请尽快在联盟 AA 处理：{url}\n{list}',
     markCards: true,
     markPrefix: '【SPY】',
     kickAnnounce: true,

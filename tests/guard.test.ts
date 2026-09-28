@@ -227,8 +227,8 @@ describe('完整流程：remind → enforce → 移出', () => {
 
 describe('永不处置的人', () => {
   for (const botRole of ['admin', 'owner'] as const) {
-    it(`群主、管理员、机器人、白名单：判为 deny、宽限期已过也不加标记、不 @、不移出（机器人是${botRole === 'owner' ? '群主' : '管理员'}）`, async () => {
-      env = await setup({ whitelist: [' 40001 '] }) // 带空格也能匹配
+    it(`「群主/管理员也加标记」关掉时：群主、管理员、机器人、白名单判为 deny、宽限期已过也不加标记、不 @、不移出（机器人是${botRole === 'owner' ? '群主' : '管理员'}）`, async () => {
+      env = await setup({ whitelist: [' 40001 '], markAdmins: false }) // 带空格也能匹配
       if (botRole === 'owner') {
         env.qq.member(GROUP, BOT)!.role = 'owner'
         env.qq.member(GROUP, OWNER)!.role = 'admin'
@@ -1363,7 +1363,7 @@ describe('群主、管理员的名片（K1）', () => {
   })
 
   it('事件复查路径：QQ 拒绝时【AA 变化复查】里列出；下一次巡检不重复、不重试', async () => {
-    env = await setup()
+    env = await setup({ markAdmins: false }) // 管理员一开始不合格时不加标记，只看名片同步
     env.aa.deny(ADMIN)
     env.qq.failCard.add(ADMIN)
     await enableMode('remind')
@@ -1990,8 +1990,8 @@ describe('0.2.1 修补', () => {
     expect(env.qq.actions('set_group_kick')).toEqual([])
   })
 
-  it('P4 加标记前实时复核：刚被设为管理员的人不加标记', async () => {
-    env = await setup()
+  it('P4 加标记前实时复核（「群主/管理员也加标记」关掉时）：刚被设为管理员的人不加标记', async () => {
+    env = await setup({ markAdmins: false })
     addMembers('40001')
     const original = env.qq.handle.bind(env.qq)
     env.qq.handle = (action, params) => {
@@ -2005,8 +2005,8 @@ describe('0.2.1 修补', () => {
   })
 
   for (const botRole of ['owner', 'admin'] as const) {
-    it(`P4 带【SPY】的管理员（机器人是${botRole === 'owner' ? '群主' : '管理员'}）：下一轮撤掉标记、删记录`, async () => {
-      env = await setup()
+    it(`P4 带【SPY】的管理员（机器人是${botRole === 'owner' ? '群主' : '管理员'}，「群主/管理员也加标记」关掉）：下一轮撤掉标记、删记录`, async () => {
+      env = await setup({ markAdmins: false })
       if (botRole === 'owner') {
         env.qq.member(GROUP, BOT)!.role = 'owner'
         env.qq.member(GROUP, OWNER)!.role = 'admin'
@@ -2022,8 +2022,8 @@ describe('0.2.1 修补', () => {
     })
   }
 
-  it('P4 QQ 不让撤管理员身上的标记：记录保留，运维群列出来，下一轮再试', async () => {
-    env = await setup()
+  it('P4 QQ 不让撤管理员身上的标记（「群主/管理员也加标记」关掉）：记录保留，运维群列出来，下一轮再试', async () => {
+    env = await setup({ markAdmins: false })
     env.qq.groups.get(GROUP)!.set('40001', { user_id: 40001, role: 'admin', card: '【SPY】张三', nickname: 'x' })
     await env.guard.store.saveTracked([{
       groupId: GROUP, qq: '40001', reason: 'NOT_BOUND', firstDeniedAt: new Date(0), graceUntil: null, marked: true,
@@ -2057,5 +2057,91 @@ describe('0.2.1 修补', () => {
     expect((await env.guard.store.groupState(GROUP)).holdSince).not.toBeNull()
     await env.guard.runReminders()
     expect([...(await env.guard.store.tracked(GROUP)).values()].every((r) => r.graceUntil === null)).toBe(true)
+  })
+})
+
+describe('不合格的群主、管理员也加标记并提醒（0.2.2）', () => {
+  const ADMIN_TEXT = '以下群主/管理员还没有满足本群的要求（不会被移出）'
+
+  it('remind：群主、管理员加上【SPY】，报告里标明「不移出」；每日提醒单独一条、没有截止时间', async () => {
+    env = await setup({ breakerPercent: 100 })
+    addMembers('40001')
+    env.aa.deny(OWNER)
+    env.aa.deny(ADMIN)
+    await enableMode('remind')
+    expect(env.qq.member(GROUP, OWNER)!.card).toBe('【SPY】群主')
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('【SPY】管理员')
+    expect(env.qq.member(GROUP, BOT)!.card).toBe('机器人')
+    const report = (await env.adminMessages()).at(-1)!
+    expect(report).toContain('· 群主(10001)（群主，不移出）')
+    expect(report).toContain('· 管理员(10002)（管理员，不移出）')
+    expect(report).not.toContain('不合格但受保护')
+    await env.guard.runReminders()
+    const messages = env.qq.groupMessages(GROUP)
+    const staff = messages.find((m) => m.text.includes(ADMIN_TEXT))!
+    expect(staff.ats.sort()).toEqual([OWNER, ADMIN].sort())
+    expect(staff.text).not.toContain('截止')
+    const normal = messages.find((m) => !m.text.includes(ADMIN_TEXT))!
+    expect(normal.ats).toEqual(['40001'])
+    expect((await env.adminMessages()).join('\n')).toContain('已提醒 3 人')
+  })
+
+  it('enforce：管理员永远没有截止时间、永远不移出；普通成员照常', async () => {
+    env = await setup({ breakerPercent: 100 })
+    addMembers('40001')
+    env.aa.deny(ADMIN)
+    await enableMode('enforce')
+    await env.guard.runReminders()
+    for (let day = 0; day < 4; day++) {
+      env.clock.now += 24 * HOUR
+      await env.guard.runReminders()
+      await env.guard.runPatrol()
+    }
+    expect(env.qq.member(GROUP, '40001')).toBeUndefined()
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('【SPY】管理员')
+    expect((await env.guard.store.tracked(GROUP)).get(ADMIN)!.graceUntil).toBeNull()
+    expect(env.qq.actions('set_group_kick').map((c) => String(c.params.user_id))).toEqual(['40001'])
+  })
+
+  it('白名单里的管理员：不加标记、不提醒', async () => {
+    env = await setup({ whitelist: [ADMIN] })
+    env.aa.deny(ADMIN)
+    await enableMode('remind')
+    await env.guard.runReminders()
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('管理员')
+    expect(env.qq.groupMessages(GROUP)).toEqual([])
+    expect((await env.adminMessages()).join('\n')).toContain('不合格但受保护 1 人')
+  })
+
+  it('合格以后：名片改成 AA 的，记录删掉', async () => {
+    env = await setup()
+    env.aa.deny(ADMIN)
+    await enableMode('remind')
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('【SPY】管理员')
+    env.aa.allow(ADMIN, '[IGC] 管理员')
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('[IGC] 管理员')
+    expect((await env.guard.store.tracked(GROUP)).has(ADMIN)).toBe(false)
+  })
+
+  it('开关关掉后：下一轮撤掉他们身上的标记', async () => {
+    env = await setup()
+    env.aa.deny(ADMIN)
+    await enableMode('remind')
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('【SPY】管理员')
+    env.config.markAdmins = false
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, ADMIN)!.card).toBe('管理员')
+    expect((await env.guard.store.tracked(GROUP)).has(ADMIN)).toBe(false)
+  })
+
+  it('report 模式：只报告、不加标记，下一轮算「仍不合格」', async () => {
+    env = await setup()
+    env.aa.deny(ADMIN)
+    await env.guard.runPatrol()
+    expect((await env.adminMessages()).at(-1)).toContain('新发现不合格 1 人\n【没有在 AA 绑定 QQ】\n· 管理员(10002)（管理员，不移出）')
+    await env.guard.runPatrol()
+    expect((await env.adminMessages()).at(-1)).toContain('仍不合格 1 人')
+    expect(env.qq.actions('set_group_card')).toEqual([])
   })
 })
