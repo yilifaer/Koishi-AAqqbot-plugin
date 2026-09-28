@@ -63,6 +63,11 @@ export interface PlanInput {
   recentUnapprovedKicks?: number
   /** members 只是群里的一部分人（事件、新人、提醒），或者名单可能不完整。 */
   partial: boolean
+  /**
+   * 这些原因的不合格只报告、不处置（不加标记、不提醒、不移出）。这个群的名单还没核对通过时，「待验证」的人
+   * 很可能是被漏掉的老成员（DECISIONS 第 65 条）。
+   */
+  holdReasons?: Set<string>
   /** 群的总人数，用来算熔断阈值。 */
   groupSize: number
   members: Member[]
@@ -109,6 +114,8 @@ export interface Plan {
   denies: Array<{ qq: string; reason: string; isNew: boolean; staff?: 'owner' | 'admin' }>
   /** 判为 deny 但受保护（白名单、机器人；markAdmins 关掉时还有群主、管理员），不处置，只报告。 */
   protectedDenies: Array<{ qq: string; reason: string }>
+  /** 只报告、不处置的不合格（holdReasons）。 */
+  heldDenies: Array<{ qq: string; reason: string }>
   reviews: Array<{ qq: string; reason: string }>
   unknowns: string[]
   /** 报告里的「新发现不合格」：上一轮还没有记录的人。 */
@@ -130,8 +137,10 @@ export interface Plan {
   unknownHeavy: boolean
   /** remind / enforce 下机器人不是群主或管理员：本群不做任何改动。 */
   noRole: boolean
-  /** 这一轮允许改动群（加标记、改名片、移出）。 */
+  /** 这一轮允许处置（提醒、移出，以及加标记、改名片）。 */
   writes: boolean
+  /** 这一轮允许改名片（加 / 撤标记、按 AA 同步）。冷静中也可以（DECISIONS 第 64 条）。 */
+  cardWrites: boolean
   track: TrackedMember[]
   untrack: string[]
   /** 先加 / 去标记，再同步名片。 */
@@ -248,6 +257,7 @@ export function planGroup(input: PlanInput): Plan {
     counts: { members: 0, allow: 0, deny: 0, review: 0, unknown: 0 },
     denies: [],
     protectedDenies: [],
+    heldDenies: [],
     reviews: [],
     unknowns: [],
     newDenies: [],
@@ -262,6 +272,7 @@ export function planGroup(input: PlanInput): Plan {
     unknownHeavy: false,
     noRole: writesMode && !botCanWrite(input.botRole),
     writes: false,
+    cardWrites: false,
     track: [],
     untrack: [],
     cards: [],
@@ -274,6 +285,7 @@ export function planGroup(input: PlanInput): Plan {
 
   const allowed: Array<{ member: Member; verdict: Verdict }> = []
   const denied: Array<{ member: Member; verdict: Verdict }> = []
+  const held: Array<{ member: Member; verdict: Verdict }> = []
   const settled: Member[] = [] // 有跟踪记录、现在合格 / 需人工 / 受保护的人
   const kickable: Array<KickPlan & { deadline: number }> = []
   /** 截止时间已到的人（不管最近有没有提醒过）：熔断按它计数（DECISIONS 第 48 条）。 */
@@ -301,6 +313,11 @@ export function planGroup(input: PlanInput): Plan {
       if (isExempt(member, input.protectedIds, !!settings.markAdmins)) {
         plan.protectedDenies.push({ qq: member.qq, reason: verdict!.reason })
         if (record) settled.push(member)
+        continue
+      }
+      if (!prot && input.holdReasons?.has(verdict!.reason)) {
+        plan.heldDenies.push({ qq: member.qq, reason: verdict!.reason })
+        held.push({ member, verdict: verdict! })
         continue
       }
       // 普通成员，或者 markAdmins 打开时的群主 / 管理员（prot 为真，永远不移出）
@@ -376,14 +393,17 @@ export function planGroup(input: PlanInput): Plan {
       : ''
   plan.writes = writesMode && (plan.breaker === 'none' || plan.breaker === 'release')
     && !plan.unknownHeavy && botCanWrite(input.botRole)
+  // 冷静期只停提醒、移出、拒绝申请，名片照常改（加标记、撤标记、按 AA 同步，DECISIONS 第 64 条）
+  plan.cardWrites = plan.writes || (writesMode && !plan.unknownHeavy && botCanWrite(input.botRole)
+    && (plan.breaker === 'trip' || plan.breaker === 'cooling' || plan.breaker === 'restart'))
 
-  // ---- 名片同步（K1）：任何模式都算，只有 writes 时真正改
+  // ---- 名片同步（K1）：任何模式都算，只有 cardWrites 时真正改
   const syncs: CardChange[] = []
   for (const { member, verdict } of allowed) {
     if (!(settings.syncCards && verdict.card && member.card !== verdict.card)) continue
     const kind = syncKind(member, input.protectedIds)
     if (kind === 'member') {
-      if (plan.writes) {
+      if (plan.cardWrites) {
         if (canEditCard(input.botRole, member)) syncs.push({ qq: member.qq, from: member.card, to: verdict.card, why: 'sync' })
       } else {
         plan.cardsPending++
@@ -391,7 +411,7 @@ export function planGroup(input: PlanInput): Plan {
     } else if (kind === 'admin' && botCanWrite(input.botRole)) {
       // 机器人是普通成员时：不改、不列
       if (canSetCard(input.botRole, member) && input.refusedCards.get(member.qq) !== verdict.card) {
-        if (plan.writes) syncs.push({ qq: member.qq, from: member.card, to: verdict.card, why: 'sync', admin: true })
+        if (plan.cardWrites) syncs.push({ qq: member.qq, from: member.card, to: verdict.card, why: 'sync', admin: true })
         else plan.cardsPending++
       } else {
         plan.adminCardsBlocked.push({ qq: member.qq, to: verdict.card })
@@ -401,27 +421,13 @@ export function planGroup(input: PlanInput): Plan {
 
   if (!plan.writes) {
     if (mode === 'report') planReport(input, plan)
-    else planRecordOnly(input, plan, denied)
+    else planRecordOnly(input, plan, denied, held, plan.cardWrites ? { settled, syncs } : null)
     return plan
   }
 
   // ---- 以下只在允许改动时执行
   const marks: CardChange[] = []
-
-  // 不再需要跟踪的人：要撤标记的等 QQ 改成功后再删记录（untrackAfter），其余直接删。
-  // 受保护的人（例如被加标记之后才当上管理员）身上的标记也撤掉（DECISIONS 第 49 条）。
-  for (const member of settled) {
-    const record = input.tracked.get(member.qq)!
-    const hasMark = record.marked && !!prefix && member.card.startsWith(prefix)
-    const sync = syncs.find((s) => s.qq === member.qq)
-    if (hasMark && sync) {
-      sync.untrackAfter = true // AA 名片会覆盖掉标记
-    } else if (hasMark && canSetCard(input.botRole, member)) {
-      marks.push(unmarkChange(member, prefix, true))
-    } else {
-      plan.untrack.push(member.qq)
-    }
-  }
+  planSettled(input, plan, settled, syncs, marks)
   const staleDue = new Set(due.filter((k) => !k.fresh).map((k) => k.qq))
   const fastReasons = settings.fastReasons ?? new Set<string>()
   const fastGraceMs = settings.fastGraceMs ?? 2 * 3600_000
@@ -440,21 +446,7 @@ export function planGroup(input: PlanInput): Plan {
       row.graceUntil = null
       plan.regraced++
     }
-    if (settings.markCards && prefix) {
-      if (member.card.startsWith(prefix)) {
-        row.marked = true
-      } else if (staff ? canSetCard(input.botRole, member) : canEditCard(input.botRole, member)) {
-        const to = markedCard(prefix, member)
-        if (staff && input.refusedCards.get(member.qq) === to) {
-          // 这张标记名片被 QQ 拒过：不再重试，运维群列一次（DECISIONS 第 55 条）
-          plan.adminCardsBlocked.push({ qq: member.qq, to })
-        } else {
-          // marked 等 QQ 确认改成功后才写（applyPlan）
-          marks.push({ qq: member.qq, from: member.card, to, why: 'mark', ...(staff ? { admin: true } : {}) })
-        }
-        row.marked = false
-      }
-    }
+    planMark(input, plan, member, row, staff, marks)
     // 「离开联盟」：单独离开的人马上提醒（冷静期结束时放行的那一批、以前冷静期批准过的人，走普通流程）
     const approved = plan.breaker === 'release' || (!!existing?.activeSince && existing.activeSince.getTime() <= input.releasedBefore)
     if (!staff && !approved && fastReasons.has(verdict.reason)) {
@@ -466,6 +458,7 @@ export function planGroup(input: PlanInput): Plan {
     plan.track.push(row)
   }
 
+  planHeld(input, plan, held, marks)
   plan.cards = [...marks, ...syncs]
   const budget = Math.max(0, settings.kickBudget)
   plan.kicks = kickable.slice(0, budget).map(({ qq, reason, name }) => ({ qq, reason, name }))
@@ -505,14 +498,77 @@ function planReport(input: PlanInput, plan: Plan) {
 }
 
 /**
- * remind / enforce 下不能改动的轮次（冷静中、无法判断太多、机器人不是管理员）：
- * 新出现的不合格只记录一行（activeSince = null，不提醒、不加标记、不移出）；已有的行只更新原因。
+ * 有跟踪记录、现在不用再管的人：要撤标记的等 QQ 改成功后再删记录（untrackAfter），其余直接删。
+ * 受保护的人（例如被加标记之后才当上管理员）身上的标记也撤掉（DECISIONS 第 49 条）。
  */
-function planRecordOnly(input: PlanInput, plan: Plan, denied: Array<{ member: Member; verdict: Verdict }>) {
+function planSettled(input: PlanInput, plan: Plan, settled: Member[], syncs: CardChange[], marks: CardChange[]) {
+  const prefix = input.settings.markPrefix
+  for (const member of settled) {
+    const record = input.tracked.get(member.qq)!
+    const hasMark = record.marked && !!prefix && member.card.startsWith(prefix)
+    const sync = syncs.find((s) => s.qq === member.qq)
+    if (hasMark && sync) {
+      sync.untrackAfter = true // AA 名片会覆盖掉标记
+    } else if (hasMark && canSetCard(input.botRole, member)) {
+      marks.push(unmarkChange(member, prefix, true))
+    } else {
+      plan.untrack.push(member.qq)
+    }
+  }
+}
+
+/**
+ * 只报告、不处置的不合格（holdReasons）：记录成「只记录」行（不提醒、不移出，也不算开始处置），
+ * 以前加的标记撤掉（marks 为 null 时这一轮不改名片）。
+ */
+function planHeld(input: PlanInput, plan: Plan, held: Array<{ member: Member; verdict: Verdict }>, marks: CardChange[] | null) {
+  const prefix = input.settings.markPrefix
+  for (const { member, verdict } of held) {
+    const record = input.tracked.get(member.qq)
+    const marked = !!record?.marked && !!prefix && member.card.startsWith(prefix)
+    plan.track.push({
+      ...(record ?? newRecord(input.groupId, member.qq, verdict.reason, input.now)),
+      reason: verdict.reason, graceUntil: null, activeSince: null, marked,
+    })
+    if (marks && marked && canEditCard(input.botRole, member)) marks.push(unmarkChange(member, prefix, false))
+  }
+}
+
+/** 给不合格的人加标记（按 markCards）。row.marked 等 QQ 确认改成功后才由 applyPlan 改成 true。 */
+function planMark(input: PlanInput, plan: Plan, member: Member, row: TrackedMember, staff: boolean, marks: CardChange[]) {
+  const prefix = input.settings.markPrefix
+  if (!input.settings.markCards || !prefix) return
+  if (member.card.startsWith(prefix)) {
+    row.marked = true
+  } else if (staff ? canSetCard(input.botRole, member) : canEditCard(input.botRole, member)) {
+    const to = markedCard(prefix, member)
+    if (staff && input.refusedCards.get(member.qq) === to) {
+      // 这张标记名片被 QQ 拒过：不再重试，运维群列一次（DECISIONS 第 55 条）
+      plan.adminCardsBlocked.push({ qq: member.qq, to })
+    } else {
+      marks.push({ qq: member.qq, from: member.card, to, why: 'mark', ...(staff ? { admin: true } : {}) })
+    }
+    row.marked = false
+  }
+}
+
+/**
+ * remind / enforce 下不能处置的轮次（冷静中、无法判断太多、机器人不是管理员）：
+ * 新出现的不合格只记录一行（activeSince = null，不提醒、不移出）；已有的行只更新原因。
+ * 冷静中（cards 不为空）名片照常改：不合格的加标记，不用再管的撤标记，合格的按 AA 同步（DECISIONS 第 64 条）。
+ */
+function planRecordOnly(input: PlanInput, plan: Plan, denied: Array<{ member: Member; verdict: Verdict }>,
+  held: Array<{ member: Member; verdict: Verdict }>, cards: { settled: Member[]; syncs: CardChange[] } | null) {
+  const marks: CardChange[] = []
+  if (cards) planSettled(input, plan, cards.settled, cards.syncs, marks)
+  planHeld(input, plan, held, cards ? marks : null)
   for (const { member, verdict } of denied) {
     const existing = input.tracked.get(member.qq)
-    plan.track.push(existing ? { ...existing, reason: verdict.reason } : newRecord(input.groupId, member.qq, verdict.reason, input.now))
+    const row = existing ? { ...existing, reason: verdict.reason } : newRecord(input.groupId, member.qq, verdict.reason, input.now)
+    if (cards) planMark(input, plan, member, row, isProtected(member, input.protectedIds), marks)
+    plan.track.push(row)
   }
+  if (cards) plan.cards = [...marks, ...cards.syncs]
 }
 
 /**
@@ -543,9 +599,9 @@ export function planRelease(
 export function emptyPlan(): Plan {
   return {
     counts: { members: 0, allow: 0, deny: 0, review: 0, unknown: 0 },
-    denies: [], protectedDenies: [], reviews: [], unknowns: [], newDenies: [], firstActions: [],
+    denies: [], protectedDenies: [], heldDenies: [], reviews: [], unknowns: [], newDenies: [], firstActions: [],
     threshold: 1, kicksDue: 0, breaker: 'none', breakerReason: '', breakerSet: [], breakerAdded: 0, regraced: 0,
-    unknownHeavy: false, noRole: false, writes: false, track: [], untrack: [], cards: [], kicks: [],
+    unknownHeavy: false, noRole: false, writes: false, cardWrites: false, track: [], untrack: [], cards: [], kicks: [],
     kicksDeferred: 0, cardsPending: 0, adminCardsBlocked: [], fastRemind: [],
   }
 }

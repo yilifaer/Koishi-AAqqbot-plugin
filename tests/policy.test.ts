@@ -363,7 +363,9 @@ describe('冷静期（熔断）', () => {
     expect(plan.writes).toBe(false)
     expect(plan.track).toHaveLength(6)
     expect(plan.track.every((r) => r.activeSince === null && !r.marked)).toBe(true)
-    expect(plan.cards).toEqual([])
+    // 名片照常加标记（DECISIONS 第 64 条），但不开始处置、不移出
+    expect(plan.cardWrites).toBe(true)
+    expect(plan.cards.map((c) => c.why)).toEqual(Array(6).fill('mark'))
     expect(plan.kicks).toEqual([])
   })
 
@@ -377,14 +379,16 @@ describe('冷静期（熔断）', () => {
     const plan = planGroup(data)
     expect(plan.breaker).toBe('trip')
     expect(plan.kicks).toEqual([])
-    expect(plan.cards).toEqual([])
+    expect(plan.cards.every((c) => c.why === 'mark')).toBe(true)
   })
 
-  it('冷静中、仍超过阈值、还没到时间：cooling，什么都不改', () => {
+  it('冷静中、仍超过阈值、还没到时间：cooling，不处置，名片照常加标记', () => {
     const plan = massDeny('enforce', 6, { cooling: { since: NOW - HOUR, set: firstSix() } })
     expect(plan.breaker).toBe('cooling')
     expect(plan.writes).toBe(false)
-    expect(plan.cards).toEqual([])
+    expect(plan.kicks).toEqual([])
+    expect(plan.track.every((r) => r.activeSince === null)).toBe(true)
+    expect(plan.cards.map((c) => c.why)).toEqual(Array(6).fill('mark'))
   })
 
   it('冷静中的局部复查、无法判断太多：即使到了时间也保持 cooling', () => {
@@ -457,14 +461,14 @@ describe('冷静期（熔断）', () => {
     expect(released.kicks).toHaveLength(6)
   })
 
-  it('冷静期间：合格了的人保留记录，等能改动时再撤标记（避免标记残留）', () => {
+  it('冷静期间：合格了的人马上改回 AA 的名片（撤掉标记），改成功后才删记录', () => {
     const data = input('remind', [[member('40001', { card: '【SPY】张三' }), verdict('40001', 'allow', 'OK', '[IGC] 张三')]],
       { cooling: { since: NOW - HOUR, set: firstSix() }, partial: true })
     data.tracked = new Map([['40001', tracked('40001')]])
     const plan = planGroup(data)
     expect(plan.breaker).toBe('cooling')
     expect(plan.untrack).toEqual([])
-    expect(plan.cards).toEqual([])
+    expect(plan.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '[IGC] 张三', why: 'sync', untrackAfter: true }])
   })
 
   it('无法判断的人太多：这一轮不做任何改动，新出现的不合格只记录', () => {
@@ -756,7 +760,8 @@ describe('熔断按时间窗口累计（0.2.1 P1 / P3）', () => {
     expect(plan.breaker).toBe('trip')
     expect(plan.breakerReason).toBe('最近 6 小时内要开始处置的不合格成员有 6 人（这一轮 3 人、之前 3 人，超过阈值 5 人）')
     expect(plan.breakerSet.sort()).toEqual(['40001', '40002', '40003', '41001', '41002', '41003'])
-    expect(plan.cards).toEqual([])
+    expect(plan.cards.every((c) => c.why === 'mark')).toBe(true)
+    expect(plan.track.filter((r) => r.activeSince === null).map((r) => r.qq).sort()).toEqual(['41001', '41002', '41003'])
   })
 
   it('窗口外的（7 小时前）、经过冷静期批准的（不晚于上次冷静结束）、已经合格的，都不计数', () => {
