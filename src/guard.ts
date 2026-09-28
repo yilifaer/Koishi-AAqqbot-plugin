@@ -48,6 +48,8 @@ export interface ModeInfo {
 
 interface ApplyResult {
   cardsOk: number
+  /** 加标记前实时复核，发现已经不是普通成员或不在群里，跳过的人数（DECISIONS 第 49 条）。 */
+  markSkipped: number
   cardsFailed: number
   cardsDeferred: number
   marked: number
@@ -102,6 +104,9 @@ const REPORT_LIST_MAX = 15
 /** adapter-onebot 的 responseTimeout 小于这个值时提醒（毫秒）。 */
 const MIN_RESPONSE_TIMEOUT_MS = 10_000
 const TIMEOUT_SUFFIX = '（LLBot 响应超时，可能其实已经成功）'
+/** 移出的操作记录里标明「截止时间在上次冷静期结束之后」，熔断按时间窗口累计时用（DECISIONS 第 46 条）。 */
+const UNAPPROVED_KICK = '未经冷静期批准'
+const MODE_RANK: Record<Mode, number> = { off: 0, report: 1, remind: 2, enforce: 3 }
 
 /** 每个机器人对象提醒过的 responseTimeout 值：同一个进程里同一个值只提醒一次。 */
 const warnedTimeouts = new WeakMap<object, number>()
@@ -133,6 +138,7 @@ export class Guard {
   private patrolQueue: Set<string> | 'all' | null = null
   private eventsBusy = false
   private remindBusy = false
+  private catchUpBusy = false
   private aaDown = false
   private botProblem: string | null = null
   private handledFlags = new Map<string, number>()
@@ -403,6 +409,8 @@ export class Guard {
     if (this.aaDown) {
       this.aaDown = false
       this.notifier.push('✅ AA 已恢复连接。')
+      // AA 掉线期间留下的入群申请，按规则补处理（DECISIONS 第 45 条）
+      this.catchUpSoon()
     }
   }
 
@@ -650,14 +658,21 @@ export class Guard {
 
     await this.migrated
     const now = this.now()
+    // 0.1.x 里改了配置、还没 aaqq.confirm 的升级：旧记录重新算「第一次处置」，照样先冷静（DECISIONS 第 50 条）
+    if (!state.lastMode && state.lastPatrolAt && isMode(state.confirmedMode) && writesMode
+      && MODE_RANK[state.confirmedMode] < MODE_RANK[mode]) {
+      await this.store.resetActive(g.groupId)
+    }
     const tracked = await this.store.tracked(g.groupId)
     const notes = await this.store.cardNotes(g.groupId)
     const kicksLastHour = await this.store.countAudit('kick', g.groupId, new Date(now - 3600_000))
+    const recentKicks = await this.store.auditSince('kick', g.groupId, new Date(now - this.cooldownMs()))
     const plan = planGroup({
       groupId: g.groupId,
       mode,
       cooling: this.coolingOf(state),
       releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
+      recentUnapprovedKicks: recentKicks.filter((row) => row.detail.includes(UNAPPROVED_KICK)).length,
       partial: suspicious,
       groupSize: members.length,
       members,
@@ -727,12 +742,13 @@ export class Guard {
         : `⏸ 冷静期重新开始：${label} 和冷静开始时相比多了 ${plan.breakerAdded} 人（${plan.breakerReason}），再观察 ${hours} 小时。`)
     } else if (plan.breaker === 'release') {
       await this.store.setGroupState(groupId, { holdSince: null, holdNote: '', holdSet: '', lastConfirmAt: new Date(now) })
-      const recovered = !plan.breakerReason
+      const recovered = !plan.breakerReason && !plan.regraced
       await this.store.audit('cool-release', groupId, '', recovered ? '已恢复正常' : '情况和冷静开始时一致')
       const elapsed = Math.max(1, Math.round((now - (state.holdSince?.getTime() ?? now)) / 3600_000))
-      this.notifier.push(recovered
-        ? `▶ 冷静期结束：${label} 已恢复正常。`
-        : `▶ 冷静期结束：${label} 情况和 ${elapsed} 小时前一致，开始正常处置。`)
+      this.notifier.push(recovered ? `▶ 冷静期结束：${label} 已恢复正常。`
+        : plan.regraced
+          ? `▶ 冷静期结束：${label} 情况和冷静开始时一致，开始正常处置（${plan.regraced} 人的截止时间已过期，重新提醒后再算宽限期）。`
+          : `▶ 冷静期结束：${label} 情况和 ${elapsed} 小时前一致，开始正常处置。`)
     }
   }
 
@@ -808,6 +824,7 @@ export class Guard {
     if (plan.unknownHeavy) actions.push('无法判断的人太多，本轮不做任何改动')
     if (applied.synced) actions.push(`同步名片 ${applied.synced} 人${applied.adminSynced.length ? `（其中群主/管理员 ${applied.adminSynced.length} 人）` : ''}`)
     if (applied.marked) actions.push(`加标记 ${applied.marked} 人`)
+    if (applied.markSkipped) actions.push(`加标记前复核后跳过 ${applied.markSkipped} 人（已经不是普通成员或不在群里）`)
     if (applied.unmarked) actions.push(`去标记 ${applied.unmarked} 人`)
     if (applied.cardsFailed) actions.push(`改名片失败 ${applied.cardsFailed} 次`)
     if (applied.cardsDeferred) actions.push(`${applied.cardsDeferred} 张名片留到下一轮再改`)
@@ -844,7 +861,10 @@ export class Guard {
     notes ??= await this.store.cardNotes(groupId)
     const byQq = new Map(members.map((m) => [m.qq, m]))
     const blocked = new Map<string, { to: string; why: string }>()
-    for (const item of plan.adminCardsBlocked) blocked.set(item.qq, { to: item.to, why: 'role' })
+    // 计划里的「改不了」：同一张名片被 QQ 拒过（名片记录里有），否则是机器人身份不够
+    for (const item of plan.adminCardsBlocked) {
+      blocked.set(item.qq, { to: item.to, why: notes.get(item.qq)?.why === 'refused' ? 'refused' : 'role' })
+    }
     for (const item of applied.adminRefused) blocked.set(item.qq, { to: item.to, why: 'refused' })
 
     const entries: string[] = []
@@ -875,7 +895,7 @@ export class Guard {
       }
     }
     const lines = entries.length
-      ? [`管理员名片与 AA 不一致（机器人没有权限改，请自己改）${entries.length} 人`, ...limitList(entries)]
+      ? [`管理员名片与 AA 不一致（机器人改不了，请自己改）${entries.length} 人`, ...limitList(entries)]
       : []
     return { lines, save, drop: [...drop] }
   }
@@ -898,7 +918,7 @@ export class Guard {
    */
   async applyPlan(bot: Bot, groupId: string, plan: Plan, signal: AbortSignal): Promise<ApplyResult> {
     const result: ApplyResult = {
-      cardsOk: 0, cardsFailed: 0, cardsDeferred: 0, marked: 0, unmarked: 0, synced: 0,
+      cardsOk: 0, markSkipped: 0, cardsFailed: 0, cardsDeferred: 0, marked: 0, unmarked: 0, synced: 0,
       adminSynced: [], adminRefused: [], kicked: [], kickFailed: 0, kickSkipped: 0,
     }
     await this.store.removeTracked(groupId, plan.untrack)
@@ -913,6 +933,15 @@ export class Guard {
       if (!(await this.stillWritable(groupId, signal))) {
         result.cardsDeferred += cards.length - index
         break
+      }
+      if (change.why === 'mark') {
+        // 加标记前实时复核（和移出一样）：刚被设为管理员、已经退群的人不加（DECISIONS 第 49 条）
+        const live = await this.platform.getMember(bot, groupId, change.qq)
+        if (!live || isProtected(live, this.protectedIds())) {
+          result.markSkipped++
+          this.logger.info('加标记前复核：群 %s 成员 %s 已经不是普通成员或不在群里，不加标记', groupId, maskId(change.qq))
+          continue
+        }
       }
       try {
         await this.platform.setCard(bot, groupId, change.qq, change.to)
@@ -980,7 +1009,9 @@ export class Guard {
         result.kicked.push({ qq: kick.qq, name: kick.name })
         this.rosters.get(groupId)?.delete(kick.qq)
         await this.store.removeTracked(groupId, [kick.qq])
-        await this.store.audit('kick', groupId, kick.qq, reasonShort(verdict.reason))
+        const releasedBefore = (await this.store.groupState(groupId)).lastConfirmAt?.getTime() ?? 0
+        const approved = deadline <= releasedBefore
+        await this.store.audit('kick', groupId, kick.qq, `${reasonShort(verdict.reason)}${approved ? '' : `；${UNAPPROVED_KICK}`}`)
       } catch (error) {
         result.kickFailed++
         this.logger.warn('移出失败 群 %s 成员 %s：%s%s', groupId, maskId(kick.qq), errorText(error), isOneBotTimeout(error) ? TIMEOUT_SUFFIX : '')
@@ -1042,9 +1073,15 @@ export class Guard {
     if (info.effective === 'off') return
     const label = this.groupLabel(g.groupId)
     const who = `${req.qq}${req.invitorId ? `（由 ${req.invitorId} 邀请）` : ''}`
+    // 这一次没处理成（暂停中、AA 无法判断）：不记「处理过」，恢复后的补处理还能按规则处理它
+    const later = (when: string) => {
+      this.handledFlags.delete(req.flag)
+      this.handledFlags.delete(personKey)
+      return this.config.catchUpRequests ? `（${when}还没人处理的话，会按规则自动补处理）` : ''
+    }
 
     if (this.paused) {
-      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理。`)
+      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理${later('恢复后')}。`)
       return
     }
     if (req.invitorId && this.config.inviteHandling === 'manual') {
@@ -1054,10 +1091,13 @@ export class Guard {
 
     const result = await this.aa.claim(req.qq, req.comment, g.groupId, { signal: this.signal, retryDelays: [2000] })
     if (!result.ok) {
-      if (result.kind === 'aborted') return
+      if (result.kind === 'aborted') {
+        later('')
+        return
+      }
       this.noteAaFailure(result, `入群申请 ${label}`)
       if (result.error === 'unknown_group') await this.refreshGroups()
-      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。AA 无法判断（${describeFailure(result)}），留给管理员处理。`)
+      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。AA 无法判断（${describeFailure(result)}），留给管理员处理${later('AA 恢复后')}。`)
       return
     }
     this.noteAaOk()
@@ -1065,7 +1105,7 @@ export class Guard {
     const outcomeText = result.claimed ? '验证码验证成功' : outcomeLabel(result.outcome)
     // 问 AA 的这段时间里可能暂停了或进入了冷静期：重新读一次
     if (this.paused || this.signal.aborted) {
-      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理。`)
+      this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}。插件暂停中，留给管理员处理${later('恢复后')}。`)
       return
     }
     const nowInfo = this.modeInfo(g.groupId, await this.store.groupState(g.groupId))
@@ -1086,7 +1126,8 @@ export class Guard {
     if (verdict.decision === 'deny') {
       const reasonText = reasonShort(verdict.reason)
       const protectedQq = this.protectedIds().has(req.qq)
-      if (this.writeMode(nowInfo) && this.config.autoReject && !protectedQq && !catchUp) {
+      // 补处理的申请和实时的一样处理（DECISIONS 第 45 条）：LLBot 的积压列表分不出是不是邀请，一律按普通申请
+      if (this.writeMode(nowInfo) && this.config.autoReject && !protectedQq) {
         const reason = fillTemplate(this.config.rejectTemplate, { hint: rejectHint(result.outcome, verdict.reason), url: this.bindUrl() }).slice(0, REJECT_REASON_MAX)
         try {
           await this.platform.handleJoinRequest(bot, req.flag, false, reason)
@@ -1098,10 +1139,9 @@ export class Guard {
         return
       }
       const why = protectedQq ? '这个 QQ 在白名单里'
-        : catchUp ? '补处理的申请不自动拒绝（可能是邀请入群）'
-          : nowInfo.cooling && (nowInfo.effective === 'remind' || nowInfo.effective === 'enforce') ? '这个群在冷静期'
-            : this.writeMode(nowInfo) ? '自动拒绝已关闭'
-              : `群模式是 ${nowInfo.effective}`
+        : nowInfo.cooling && (nowInfo.effective === 'remind' || nowInfo.effective === 'enforce') ? '这个群在冷静期'
+          : this.writeMode(nowInfo) ? '自动拒绝已关闭'
+            : `群模式是 ${nowInfo.effective}`
       this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}，AA 判定不合格（${reasonText}；${outcomeText}）。${why}，留给管理员处理。`)
       return
     }
@@ -1110,7 +1150,7 @@ export class Guard {
     this.notifier.push(`📥 ${source}：${who} 申请加入 ${label}，${why}，留给管理员处理。`)
   }
 
-  /** 机器人重新上线：补处理掉线期间积压的入群申请（DECISIONS 第 13 条）。 */
+  /** 机器人重新上线：补处理掉线期间积压的入群申请（DECISIONS 第 13、45 条）。 */
   private async onBotStatus(changed: Bot) {
     if (changed.platform !== 'onebot' || changed.status !== Universal.Status.ONLINE) return
     const bot = this.pickBot()
@@ -1120,20 +1160,38 @@ export class Guard {
     if (!this.lastRound) this.requestPatrol()
   }
 
+  /**
+   * 补处理还挂着的入群申请，规则和实时申请完全一样（该同意的同意、该拒绝的拒绝）。
+   * 在这些时候运行：插件启动、机器人重新上线、AA 恢复连接、解除暂停。已经有人处理过的申请 QQ 会标成已处理，不会重复。
+   */
   async catchUpRequests(bot: Bot) {
-    if (!this.groupsLoaded || this.paused) return
-    let pending
+    if (!this.groupsLoaded || this.paused || this.catchUpBusy) return
+    this.catchUpBusy = true
     try {
-      pending = await this.platform.pendingJoinRequests(bot)
-    } catch (error) {
-      this.logger.warn('补拉入群申请失败（%s）：%s', isOneBotTimeout(error) ? ONEBOT_TIMEOUT_HINT : 'LLBot 可能不支持 get_group_system_msg', errorText(error))
-      return
+      let pending
+      try {
+        pending = await this.platform.pendingJoinRequests(bot)
+      } catch (error) {
+        this.logger.warn('补拉入群申请失败（%s）：%s', isOneBotTimeout(error) ? ONEBOT_TIMEOUT_HINT : 'LLBot 可能不支持 get_group_system_msg', errorText(error))
+        return
+      }
+      for (const req of pending) {
+        if (this.signal.aborted || this.paused) return
+        await this.handleJoinRequest(bot, req, '补处理的入群申请', true)
+        await sleep(1000, this.signal)
+      }
+    } finally {
+      this.catchUpBusy = false
     }
-    for (const req of pending) {
-      if (this.signal.aborted) return
-      await this.handleJoinRequest(bot, req, '补处理的入群申请', true)
-      await sleep(1000, this.signal)
-    }
+  }
+
+  /** 在后台补处理一次积压的申请（AA 恢复连接、解除暂停时）。 */
+  private catchUpSoon() {
+    if (!this.config.catchUpRequests) return
+    this.safely('补处理积压的入群申请', async () => {
+      const bot = this.pickBot()
+      if (bot) await this.catchUpRequests(bot)
+    })
   }
 
   // ------------------------------------------------------------ 新人入群、退群
@@ -1191,6 +1249,7 @@ export class Guard {
     }
     this.noteAaOk()
     await this.migrated
+    const now = this.now()
     const plan = planGroup({
       groupId,
       mode: info.effective,
@@ -1205,9 +1264,11 @@ export class Guard {
       selfIds: this.platform.allSelfIds(),
       refusedCards: refusedCards(await this.store.cardNotes(groupId)),
       botRole,
-      now: this.now(),
+      now,
       settings: this.planSettings(0, false),
     })
+    // 新人也按时间窗口累计：最近开始处置的人已经很多时，进入冷静期（DECISIONS 第 46 条）
+    await this.applyBreaker(groupId, plan, state, now)
     await this.applyPlan(bot, groupId, plan, this.signal)
     const verdict = result.verdicts.get(qq)!
     const name = this.who(member, qq)
@@ -1219,7 +1280,8 @@ export class Guard {
       await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')
     }
     const action = plan.writes ? '已开始宽限并提醒'
-      : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
+      : plan.breaker === 'trip' ? '这个群进入冷静期，只记录'
+        : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
         : plan.noRole ? '机器人不是群主或管理员，只记录'
           : `群模式 ${info.effective}，只报告`
     this.notifier.push(`👋 ${label} 新成员 ${name}：${verdict.decision === 'deny' ? `不合格（${reasonShort(verdict.reason)}），${action}` : verdict.decision === 'review' ? `需人工处理（${reasonShort(verdict.reason)}）` : 'AA 无法判断'}。`)
@@ -1510,6 +1572,7 @@ export class Guard {
       this.round?.abort()
     } else {
       this.requestPatrol()
+      this.catchUpSoon()
     }
   }
 

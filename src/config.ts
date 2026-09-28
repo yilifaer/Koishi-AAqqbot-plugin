@@ -101,7 +101,7 @@ export const Config: Schema<Config> = Schema.intersect([
     ]).default('same')
       .description('群成员邀请别人入群、需要审核时（申请里没有验证信息）怎么处理。'),
     catchUpRequests: Schema.boolean().default(true)
-      .description('机器人重新上线时，补处理掉线期间还挂着的入群申请。'),
+      .description('补处理还挂着的入群申请（插件启动、机器人重新上线、AA 恢复连接、解除暂停时），规则和实时申请一样：合格的同意，不合格的按上面的设置拒绝。'),
   }).description('入群申请'),
 
   Schema.object({
@@ -110,7 +110,7 @@ export const Config: Schema<Config> = Schema.intersect([
     eventPollSeconds: Schema.natural().min(30).max(600).default(60)
       .description('每隔几秒向 AA 拉取一次变化（解绑、退组等），发现后立即复查相关的人。'),
     syncCards: Schema.boolean().default(true)
-      .description('按 AA 算好的名片同步合格成员的群名片（只在 remind / enforce 模式的群里；成员自己改掉的会在下次巡检时改回）。群主、管理员也同步（机器人是群主时才能改管理员；改不了的会在运维群列出来一次）。'),
+      .description('按 AA 算好的名片同步合格成员的群名片（只在 remind / enforce 模式的群里；成员自己改掉的会在下次巡检时改回）。群主、管理员也同步（QQ 不让改时会在运维群列出来一次）。'),
   }).description('巡检与群名片'),
 
   Schema.object({
