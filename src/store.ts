@@ -206,18 +206,30 @@ export class Store {
   }
 
   /**
-   * 启动时迁移旧数据（0.1.x → 0.2.0）。
+   * 启动时迁移旧数据（0.1.x → 0.2.x）。
    * 迁移失败是安全的：旧记录会被当成「还没处置过」，最多让某个群多进一次冷静期、多一条报警。
+   * 第一次开始迁移时记下时间（migrationCutoff），只转换那之前的记录：迁移中途失败、0.2.x 照常运行时写下的
+   * 「只记录」行，下次重跑迁移也不会被当成「处置过」（DECISIONS 第 47 条）。
    */
   async migrate() {
     if (((await this.getKv<number>('schema')) ?? 1) >= SCHEMA_VERSION) return
+    let cutoff = await this.getKv<number>('migrationCutoff')
+    if (typeof cutoff !== 'number') {
+      cutoff = this.now()
+      await this.setKv('migrationCutoff', cutoff)
+    }
     // 0.1.x 只在 remind / enforce 下写跟踪记录，所以旧记录都「处置过」
     for (const row of await this.db.get('aaqqbot_member', {})) {
-      if (!row.activeSince) {
+      if (!row.activeSince && row.firstDeniedAt && new Date(row.firstDeniedAt).getTime() < cutoff) {
         await this.db.set('aaqqbot_member', { groupId: row.groupId, qq: row.qq }, { activeSince: row.firstDeniedAt })
       }
     }
     await this.setKv('schema', SCHEMA_VERSION)
+  }
+
+  /** 这个群的跟踪记录都改回「还没处置过」（0.1.x 里没确认过的模式升级，DECISIONS 第 50 条）。 */
+  async resetActive(groupId: string) {
+    await this.db.set('aaqqbot_member', { groupId }, { activeSince: null })
   }
 
   async tracked(groupId: string): Promise<Map<string, TrackedMember>> {
@@ -301,6 +313,10 @@ export class Store {
   async countAudit(action: string, groupId: string, since: Date): Promise<number> {
     const rows = await this.db.get('aaqqbot_audit', { action, groupId, at: { $gte: since } }, ['id'])
     return rows.length
+  }
+
+  async auditSince(action: string, groupId: string, since: Date): Promise<AuditRow[]> {
+    return this.db.get('aaqqbot_audit', { action, groupId, at: { $gte: since } })
   }
 
   async recentAudit(limit: number): Promise<AuditRow[]> {

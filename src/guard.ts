@@ -48,6 +48,8 @@ export interface ModeInfo {
 
 interface ApplyResult {
   cardsOk: number
+  /** 加标记前实时复核，发现已经不是普通成员或不在群里，跳过的人数（DECISIONS 第 49 条）。 */
+  markSkipped: number
   cardsFailed: number
   cardsDeferred: number
   marked: number
@@ -102,6 +104,9 @@ const REPORT_LIST_MAX = 15
 /** adapter-onebot 的 responseTimeout 小于这个值时提醒（毫秒）。 */
 const MIN_RESPONSE_TIMEOUT_MS = 10_000
 const TIMEOUT_SUFFIX = '（LLBot 响应超时，可能其实已经成功）'
+/** 移出的操作记录里标明「截止时间在上次冷静期结束之后」，熔断按时间窗口累计时用（DECISIONS 第 46 条）。 */
+const UNAPPROVED_KICK = '未经冷静期批准'
+const MODE_RANK: Record<Mode, number> = { off: 0, report: 1, remind: 2, enforce: 3 }
 
 /** 每个机器人对象提醒过的 responseTimeout 值：同一个进程里同一个值只提醒一次。 */
 const warnedTimeouts = new WeakMap<object, number>()
@@ -653,14 +658,21 @@ export class Guard {
 
     await this.migrated
     const now = this.now()
+    // 0.1.x 里改了配置、还没 aaqq.confirm 的升级：旧记录重新算「第一次处置」，照样先冷静（DECISIONS 第 50 条）
+    if (!state.lastMode && state.lastPatrolAt && isMode(state.confirmedMode) && writesMode
+      && MODE_RANK[state.confirmedMode] < MODE_RANK[mode]) {
+      await this.store.resetActive(g.groupId)
+    }
     const tracked = await this.store.tracked(g.groupId)
     const notes = await this.store.cardNotes(g.groupId)
     const kicksLastHour = await this.store.countAudit('kick', g.groupId, new Date(now - 3600_000))
+    const recentKicks = await this.store.auditSince('kick', g.groupId, new Date(now - this.cooldownMs()))
     const plan = planGroup({
       groupId: g.groupId,
       mode,
       cooling: this.coolingOf(state),
       releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
+      recentUnapprovedKicks: recentKicks.filter((row) => row.detail.includes(UNAPPROVED_KICK)).length,
       partial: suspicious,
       groupSize: members.length,
       members,
@@ -730,12 +742,13 @@ export class Guard {
         : `⏸ 冷静期重新开始：${label} 和冷静开始时相比多了 ${plan.breakerAdded} 人（${plan.breakerReason}），再观察 ${hours} 小时。`)
     } else if (plan.breaker === 'release') {
       await this.store.setGroupState(groupId, { holdSince: null, holdNote: '', holdSet: '', lastConfirmAt: new Date(now) })
-      const recovered = !plan.breakerReason
+      const recovered = !plan.breakerReason && !plan.regraced
       await this.store.audit('cool-release', groupId, '', recovered ? '已恢复正常' : '情况和冷静开始时一致')
       const elapsed = Math.max(1, Math.round((now - (state.holdSince?.getTime() ?? now)) / 3600_000))
-      this.notifier.push(recovered
-        ? `▶ 冷静期结束：${label} 已恢复正常。`
-        : `▶ 冷静期结束：${label} 情况和 ${elapsed} 小时前一致，开始正常处置。`)
+      this.notifier.push(recovered ? `▶ 冷静期结束：${label} 已恢复正常。`
+        : plan.regraced
+          ? `▶ 冷静期结束：${label} 情况和冷静开始时一致，开始正常处置（${plan.regraced} 人的截止时间已过期，重新提醒后再算宽限期）。`
+          : `▶ 冷静期结束：${label} 情况和 ${elapsed} 小时前一致，开始正常处置。`)
     }
   }
 
@@ -811,6 +824,7 @@ export class Guard {
     if (plan.unknownHeavy) actions.push('无法判断的人太多，本轮不做任何改动')
     if (applied.synced) actions.push(`同步名片 ${applied.synced} 人${applied.adminSynced.length ? `（其中群主/管理员 ${applied.adminSynced.length} 人）` : ''}`)
     if (applied.marked) actions.push(`加标记 ${applied.marked} 人`)
+    if (applied.markSkipped) actions.push(`加标记前复核后跳过 ${applied.markSkipped} 人（已经不是普通成员或不在群里）`)
     if (applied.unmarked) actions.push(`去标记 ${applied.unmarked} 人`)
     if (applied.cardsFailed) actions.push(`改名片失败 ${applied.cardsFailed} 次`)
     if (applied.cardsDeferred) actions.push(`${applied.cardsDeferred} 张名片留到下一轮再改`)
@@ -904,7 +918,7 @@ export class Guard {
    */
   async applyPlan(bot: Bot, groupId: string, plan: Plan, signal: AbortSignal): Promise<ApplyResult> {
     const result: ApplyResult = {
-      cardsOk: 0, cardsFailed: 0, cardsDeferred: 0, marked: 0, unmarked: 0, synced: 0,
+      cardsOk: 0, markSkipped: 0, cardsFailed: 0, cardsDeferred: 0, marked: 0, unmarked: 0, synced: 0,
       adminSynced: [], adminRefused: [], kicked: [], kickFailed: 0, kickSkipped: 0,
     }
     await this.store.removeTracked(groupId, plan.untrack)
@@ -919,6 +933,15 @@ export class Guard {
       if (!(await this.stillWritable(groupId, signal))) {
         result.cardsDeferred += cards.length - index
         break
+      }
+      if (change.why === 'mark') {
+        // 加标记前实时复核（和移出一样）：刚被设为管理员、已经退群的人不加（DECISIONS 第 49 条）
+        const live = await this.platform.getMember(bot, groupId, change.qq)
+        if (!live || isProtected(live, this.protectedIds())) {
+          result.markSkipped++
+          this.logger.info('加标记前复核：群 %s 成员 %s 已经不是普通成员或不在群里，不加标记', groupId, maskId(change.qq))
+          continue
+        }
       }
       try {
         await this.platform.setCard(bot, groupId, change.qq, change.to)
@@ -986,7 +1009,9 @@ export class Guard {
         result.kicked.push({ qq: kick.qq, name: kick.name })
         this.rosters.get(groupId)?.delete(kick.qq)
         await this.store.removeTracked(groupId, [kick.qq])
-        await this.store.audit('kick', groupId, kick.qq, reasonShort(verdict.reason))
+        const releasedBefore = (await this.store.groupState(groupId)).lastConfirmAt?.getTime() ?? 0
+        const approved = deadline <= releasedBefore
+        await this.store.audit('kick', groupId, kick.qq, `${reasonShort(verdict.reason)}${approved ? '' : `；${UNAPPROVED_KICK}`}`)
       } catch (error) {
         result.kickFailed++
         this.logger.warn('移出失败 群 %s 成员 %s：%s%s', groupId, maskId(kick.qq), errorText(error), isOneBotTimeout(error) ? TIMEOUT_SUFFIX : '')
@@ -1224,6 +1249,7 @@ export class Guard {
     }
     this.noteAaOk()
     await this.migrated
+    const now = this.now()
     const plan = planGroup({
       groupId,
       mode: info.effective,
@@ -1238,9 +1264,11 @@ export class Guard {
       selfIds: this.platform.allSelfIds(),
       refusedCards: refusedCards(await this.store.cardNotes(groupId)),
       botRole,
-      now: this.now(),
+      now,
       settings: this.planSettings(0, false),
     })
+    // 新人也按时间窗口累计：最近开始处置的人已经很多时，进入冷静期（DECISIONS 第 46 条）
+    await this.applyBreaker(groupId, plan, state, now)
     await this.applyPlan(bot, groupId, plan, this.signal)
     const verdict = result.verdicts.get(qq)!
     const name = this.who(member, qq)
@@ -1252,7 +1280,8 @@ export class Guard {
       await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')
     }
     const action = plan.writes ? '已开始宽限并提醒'
-      : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
+      : plan.breaker === 'trip' ? '这个群进入冷静期，只记录'
+        : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
         : plan.noRole ? '机器人不是群主或管理员，只记录'
           : `群模式 ${info.effective}，只报告`
     this.notifier.push(`👋 ${label} 新成员 ${name}：${verdict.decision === 'deny' ? `不合格（${reasonShort(verdict.reason)}），${action}` : verdict.decision === 'review' ? `需人工处理（${reasonShort(verdict.reason)}）` : 'AA 无法判断'}。`)
