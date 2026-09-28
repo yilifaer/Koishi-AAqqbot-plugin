@@ -2,8 +2,6 @@ import { Schema } from 'koishi'
 
 export type Mode = 'off' | 'report' | 'remind' | 'enforce'
 
-export const MODE_RANK: Record<Mode, number> = { off: 0, report: 1, remind: 2, enforce: 3 }
-
 export interface GroupModeEntry {
   groupId: string
   mode: Mode
@@ -43,10 +41,11 @@ export interface Config {
   markPrefix: string
   kickAnnounce: boolean
   kickAnnounceTemplate: string
-  // 熔断
+  // 防误踢（冷静期）
   breakerCount: number
   breakerPercent: number
   kickPerHour: number
+  breakerCooldownHours: number
 }
 
 const modeSchema = Schema.union([
@@ -78,7 +77,7 @@ export const Config: Schema<Config> = Schema.intersect([
     operators: Schema.array(Schema.string()).role('table').default([])
       .description('运维名单（QQ 号）：只有名单里、并且 Koishi 权限等级 ≥ 3 的人能用管理命令。'),
     whitelist: Schema.array(Schema.string()).role('table').default([])
-      .description('白名单（QQ 号）：这些人永远不会被提醒、改名片或移出。机器人自己、群主、群管理员已自动保护，不用填。'),
+      .description('白名单（QQ 号）：这些人永远不会被提醒、加标记或移出，名片也不改。机器人自己、群主、群管理员已自动保护（永远不会被提醒、加标记或移出），不用填。'),
   }).description('机器人与运维'),
 
   Schema.object({
@@ -88,7 +87,7 @@ export const Config: Schema<Config> = Schema.intersect([
       groupId: Schema.string().required().description('群号'),
       mode: modeSchema.default('report').description('模式'),
     })).role('table').default([])
-      .description('单独设置某些群的模式。**升级到 remind 或 enforce 后，要等一轮巡检报告出来，由管理员发送 `aaqq.confirm 群号` 确认后才真正生效**；降级立即生效。'),
+      .description('单独设置某些群的模式。改了以后下一轮巡检（保存配置后约 20 秒）就生效；一下子要开始处置的人太多时会先进入冷静期（见「防误踢」）。降级立即生效。'),
   }).description('群模式'),
 
   Schema.object({
@@ -111,7 +110,7 @@ export const Config: Schema<Config> = Schema.intersect([
     eventPollSeconds: Schema.natural().min(30).max(600).default(60)
       .description('每隔几秒向 AA 拉取一次变化（解绑、退组等），发现后立即复查相关的人。'),
     syncCards: Schema.boolean().default(true)
-      .description('按 AA 算好的名片同步合格成员的群名片（只在 remind / enforce 模式的群里；成员自己改掉的会在下次巡检时改回）。'),
+      .description('按 AA 算好的名片同步合格成员的群名片（只在 remind / enforce 模式的群里；成员自己改掉的会在下次巡检时改回）。群主、管理员也同步（机器人是群主时才能改管理员；改不了的会在运维群列出来一次）。'),
   }).description('巡检与群名片'),
 
   Schema.object({
@@ -135,10 +134,12 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     breakerCount: Schema.natural().min(1).max(100).default(5)
-      .description('熔断人数：一轮里某个群新增的不合格人数超过这个数（或超过下面的比例，取较小者，但至少为 1）时，这个群这一轮什么都不做，只报警，等管理员发送 `aaqq.confirm 群号` 确认。'),
+      .description('阈值人数：一轮里某个群要开始处置的不合格人数（或一次到期要移出的人数）超过这个数（或超过下面的比例，取较小者，但至少为 1）时，这一轮什么都不做，只报警，这个群进入冷静期（见下面），不再需要管理员确认。'),
     breakerPercent: Schema.natural().min(1).max(100).default(10)
-      .description('熔断比例（占群人数的百分比）。'),
+      .description('阈值比例（占群人数的百分比）。'),
     kickPerHour: Schema.natural().min(1).max(100).default(10)
       .description('每个群每小时最多移出几个人，超过的留到下一轮。'),
-  }).description('防误踢（熔断）'),
+    breakerCooldownHours: Schema.natural().min(1).max(72).default(6)
+      .description('冷静期：一轮里要开始处置的人太多时，这个群先停止处置这么多小时，只报警。到时间后的第一次巡检如果还是那批人，就自动继续；变化很大就重新冷静。冷静中的巡检发现已经恢复正常（例如 AA 改回来了）会立即结束。紧急情况用 aaqq.pause。'),
+  }).description('防误踢（冷静期）'),
 ]) as Schema<Config>

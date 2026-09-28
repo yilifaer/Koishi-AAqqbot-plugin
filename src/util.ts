@@ -124,3 +124,98 @@ export function errorText(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
 }
+
+// ---------------------------------------------------------------- 名字显示（K7 / K8）
+
+// 必须用 \u 转义写，不要直接粘贴看不见的字符（复制时容易丢，审查也看不出来）
+const INVISIBLE = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u3164\u115F\u1160\uFFA0\u180E\u034F]/g
+
+/** 去掉零宽字符、韩文填充符等看不见的字符，再去掉首尾空白（包括全角空格）。名字中间的空格保留。 */
+export function cleanName(text: string): string {
+  return (text ?? '').replace(INVISIBLE, '').trim()
+}
+
+/** 报告里显示的名字：名片（去掉标记）→ 昵称 → 空字符串。 */
+export function displayName(card: string, nickname: string, markPrefix: string): string {
+  for (const raw of [card, nickname]) {
+    const cleaned = cleanName(raw)
+    const name = markPrefix && cleaned.startsWith(markPrefix) ? cleanName(cleaned.slice(markPrefix.length)) : cleaned
+    if (name) return name
+  }
+  return ''
+}
+
+// ---------------------------------------------------------------- OneBot 错误（K9）
+
+export const ONEBOT_TIMEOUT_HINT = 'LLBot 响应超时，检查 adapter-onebot 的 responseTimeout（建议 60000 毫秒）'
+
+/** adapter-onebot 的 TimeoutError：LLBot 没在 responseTimeout 内回应（其实可能已经成功了）。 */
+export function isOneBotTimeout(error: unknown): boolean {
+  return error instanceof Error && (error.constructor?.name === 'TimeoutError' || /^Timeout with request/.test(error.message))
+}
+
+/** adapter-onebot 的 SenderError：LLBot 明确返回了失败（retcode 不为 0）。 */
+export function isOneBotRefusal(error: unknown): boolean {
+  return error instanceof Error && !isOneBotTimeout(error)
+    && (error.constructor?.name === 'SenderError' || /^Error with request/.test(error.message))
+}
+
+// ---------------------------------------------------------------- 消息分段（K13）
+
+/** QQ 单条消息按不超过这么多字发。 */
+export const MAX_MESSAGE_CHARS = 1500
+
+/** 按字符（不是 UTF-16 码元）计数，emoji 算 1 个。 */
+export function charLength(text: string): number {
+  return Array.from(text).length
+}
+
+/**
+ * 把一段文字切成每条不超过 max 字的若干条：优先在空行（小节边界）切，其次在换行切；
+ * 单独一行还是太长才硬切（结尾加「…」），不会切断汉字或 emoji。切成多条时每条开头加（i/N）。
+ */
+export function splitMessage(text: string, max = MAX_MESSAGE_CHARS): string[] {
+  if (charLength(text) <= max) return [text]
+  const parts = splitInto(text, max - 12) // 给（i/N）序号留位置
+  if (parts.length <= 1) return parts
+  return parts.map((part, index) => `（${index + 1}/${parts.length}）${part}`)
+}
+
+function splitInto(text: string, limit: number): string[] {
+  // 先拆成「单元」：小节（空行分隔）→ 太长的小节再拆成行 → 太长的行再硬切
+  const units: Array<{ text: string; sep: string }> = []
+  text.split(/\n{2,}/).forEach((block, blockIndex) => {
+    const blockSep = blockIndex === 0 ? '' : '\n\n'
+    if (charLength(block) <= limit) {
+      units.push({ text: block, sep: blockSep })
+      return
+    }
+    block.split('\n').forEach((line, lineIndex) => {
+      const lineSep = lineIndex === 0 ? blockSep : '\n'
+      if (charLength(line) <= limit) {
+        units.push({ text: line, sep: lineSep })
+        return
+      }
+      const chars = Array.from(line)
+      for (let i = 0; i < chars.length; i += limit - 1) {
+        const piece = chars.slice(i, i + limit - 1).join('')
+        units.push({ text: i + limit - 1 < chars.length ? `${piece}…` : piece, sep: i === 0 ? lineSep : '' })
+      }
+    })
+  })
+  // 再按顺序装进一条条消息
+  const parts: string[] = []
+  let current = ''
+  for (const unit of units) {
+    if (!current) {
+      current = unit.text
+    } else if (charLength(current) + charLength(unit.sep) + charLength(unit.text) <= limit) {
+      current += unit.sep + unit.text
+    } else {
+      parts.push(current)
+      current = unit.text
+    }
+  }
+  if (current) parts.push(current)
+  return parts
+}
