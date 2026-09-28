@@ -33,8 +33,10 @@ export interface SplitReport {
   delivered: number
   timedOut: number
   hidden: number
-  /** 没发出去的条数（拒收后没法再拆、超过上限、其他失败、暂停了）。 */
+  /** 没发出去的条数（拒收后没法再拆、超过上限、其他失败）。 */
   lost: number
+  /** 轮到时已经暂停或不能再发、没有发的条数。 */
+  skipped: number
 }
 
 export interface SplitOptions<T> {
@@ -56,7 +58,7 @@ export interface SplitOptions<T> {
  * send(part, label) 负责真正发出一条（包括序号、限速、发之前的检查和发成功后的记录）。
  */
 export async function sendSplitting<T>(items: T[], send: (part: T[], label: string) => Promise<SendResult>, options: SplitOptions<T> = {}): Promise<SplitReport> {
-  const report: SplitReport = { split: false, halved: false, pieces: 0, delivered: 0, timedOut: 0, hidden: 0, lost: 0 }
+  const report: SplitReport = { split: false, halved: false, pieces: 0, delivered: 0, timedOut: 0, hidden: 0, lost: 0, skipped: 0 }
   const tally = (part: T[], label: string, result: SendResult, hidden = false) => {
     report.pieces++
     if (result === 'sent') {
@@ -65,7 +67,8 @@ export async function sendSplitting<T>(items: T[], send: (part: T[], label: stri
     } else if (result === 'timeout') {
       report.timedOut++
     } else {
-      report.lost++
+      if (result === 'skipped') report.skipped++
+      else report.lost++
       options.onLost?.(part, label, result)
     }
   }
@@ -95,11 +98,12 @@ export async function sendSplitting<T>(items: T[], send: (part: T[], label: stri
 /** 拆开重发的结果，写日志用。 */
 export function describeSplit(report: SplitReport): string {
   const how = report.halved ? `拆成 ${report.pieces} 条重发` : '只有 1 行，没法拆开'
-  const outcome = report.lost || report.timedOut
+  const outcome = report.lost || report.timedOut || report.skipped
     ? [
       `没有全部送达：${report.delivered} 条送达`,
       report.timedOut ? `，${report.timedOut} 条 LLBot 响应超时（可能已经送达）` : '',
       report.lost ? `，${report.lost} 条没发出（内容见前面的日志）` : '',
+      report.skipped ? `，${report.skipped} 条轮到时已经暂停或不能再发，没有发` : '',
     ].join('')
     : '全部送达'
   return `被 QQ 拒收，${how}，${outcome}${report.hidden ? `；其中 ${report.hidden} 条隐藏了名字` : ''}`

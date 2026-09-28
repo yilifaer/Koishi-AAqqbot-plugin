@@ -1104,7 +1104,7 @@ export class Guard {
       }, {
         hide: () => HIDDEN_NAME,
         onLost: (part, _, why) => {
-          if (why !== 'skipped') this.logger.warn('群 %s 的移出公告里这些名字没有发出：%s', groupId, part.join('、'))
+          this.logger.warn('群 %s 的移出公告没有发出（%s），这些名字没公告：%s', groupId, why === 'skipped' ? '已经暂停' : why, part.join('、'))
         },
         onHidden: (name) => this.logger.warn('群 %s 的移出公告里「%s」被 QQ 拒收，已隐藏这个名字', groupId, name),
       })
@@ -1371,12 +1371,14 @@ export class Guard {
       return
     }
     const fast = plan.writes && plan.fastRemind.some((r) => r.qq === qq)
+    let notReminded = false
     if (fast) {
-      await this.sendFastReminders(bot, groupId, info.effective, plan)
+      notReminded = !(await this.sendFastReminders(bot, groupId, info.effective, plan))
     } else if (plan.writes && plan.newDenies.length) {
-      await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')
+      notReminded = !(await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')).sent
     }
-    const action = fast ? '已不具备成员资格，已马上提醒'
+    const action = notReminded ? `${fast ? '已不具备成员资格，' : ''}提醒没有发出去（没有定截止时间，不会因此被移出）`
+      : fast ? '已不具备成员资格，已马上提醒'
       : plan.writes ? '已开始宽限并提醒'
       : plan.breaker === 'trip' ? '这个群进入冷静期，只记录'
         : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
@@ -1610,9 +1612,9 @@ export class Guard {
   }
 
   /**
-   * 在群里 @ 提醒（每条最多 20 人，文字太长时再对半拆，每条不超过 1500 字）。
-   * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（现在 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒。
-   * 发送失败不重发（超时的其实可能已经发出去了），也不记提醒时间：没收到提醒的人不会被移出。
+   * 在群里 @ 提醒（每条最多 20 人、约 800 字，DECISIONS 第 62 条）。
+   * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（发出时间 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒。
+   * 被 QQ 拒收就对半拆开重发；超时、其他失败不重发（超时的其实可能已经发出去了），也不记提醒时间：没收到提醒的人不会被移出。
    */
   async sendReminder(bot: Bot, groupId: string, mode: Mode, rows: TrackedMember[], source: 'daily' | 'newcomer' | 'fast' = 'daily', staff = false):
     Promise<{ sent: number; failed: number; timedOut: boolean; reminded: TrackedMember[] }> {
@@ -1668,14 +1670,19 @@ export class Guard {
           skipped += part.length
           return 'skipped'
         }
-        const now = this.now()
-        const updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
-        const content: Fragment[] = [h.text(head)]
-        for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
-        if (tail) content.push(h.text(tail))
+        // 轮到这一条时才生成内容：截止时间、提醒时间按真正发出的时间算（排队可能要等一会儿）
+        let updated: TrackedMember[] = []
+        const build = () => {
+          const now = this.now()
+          updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
+          const content: Fragment[] = [h.text(head)]
+          for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
+          if (tail) content.push(h.text(tail))
+          return content as any
+        }
         try {
           // 排队等发的这段时间里可能暂停了或进入了冷静期：发之前再确认一次
-          if (!(await this.platform.sendGroup(bot, groupId, content as any, () => this.stillWritable(groupId, this.signal)))) {
+          if (!(await this.platform.sendGroup(bot, groupId, build, () => this.stillWritable(groupId, this.signal)))) {
             stopped = true
             skipped += part.length
             return 'skipped'
@@ -1694,7 +1701,8 @@ export class Guard {
         return 'sent'
       }, {
         onLost: (part, _, why) => {
-          if (why === 'refused') this.logger.warn('群 %s 的%s被 QQ 拒收，单独 @ 也发不出去，这些人没提醒到：%s', groupId, what, part.map((row) => maskId(row.qq)).join('、'))
+          const reason = why === 'refused' ? '被 QQ 拒收，单独 @ 也发不出去' : why === 'skipped' ? '轮到时已经暂停或不能再发' : '发送失败'
+          this.logger.warn('群 %s 的%s没有发出（%s），这些人没提醒到：%s', groupId, what, reason, part.map((row) => maskId(row.qq)).join('、'))
         },
       })
       outcome.sent += delivered
@@ -1707,8 +1715,8 @@ export class Guard {
   // ------------------------------------------------------------ 离开联盟：马上提醒、到点移出（DECISIONS 第 52 条）
 
   /** 这一轮发现的「离开联盟」的人马上提醒，运维群每人一行 ⚡，然后重新安排到期检查。 */
-  private async sendFastReminders(bot: Bot, groupId: string, mode: Mode, plan: Plan) {
-    if (!plan.writes || !plan.fastRemind.length) return
+  private async sendFastReminders(bot: Bot, groupId: string, mode: Mode, plan: Plan): Promise<number> {
+    if (!plan.writes || !plan.fastRemind.length) return 0
     const result = await this.sendReminder(bot, groupId, mode, plan.fastRemind, 'fast')
     const label = this.groupLabel(groupId)
     const roster = this.rosters.get(groupId)
@@ -1722,6 +1730,7 @@ export class Guard {
       this.notifier.push(`⚠ ${label} 离开联盟的提醒没有发出去（${result.failed} 人），没有定截止时间，下一次复查或巡检时再试${result.timedOut ? '；LLBot 响应超时，群里可能其实已经看到了' : ''}`)
     }
     await this.scheduleFastKicks()
+    return result.reminded.length
   }
 
   /** 按最早的一个「离开联盟」截止时间安排到期检查（插件启动、定下截止时间、解除暂停时调用）。 */
@@ -1929,12 +1938,12 @@ export class Guard {
   }
 }
 
-/** 名片记录里被 QQ 拒过的：QQ → 那张 AA 名片（同一张不再重试）。 */
 /** 白名单里写得不对的条目：一条一行（名单分短、被拒时拆开都按行来，DECISIONS 第 62 条）。 */
 function badWhitelistText(bad: string[]): string {
   return [`⚠ 白名单里有 ${bad.length} 条写得不对，没有生效（每一条只能填一个 QQ 号）：`, ...bad.map((entry) => `· ${entry}`)].join('\n')
 }
 
+/** 名片记录里被 QQ 拒过的：QQ → 那张 AA 名片（同一张不再重试）。 */
 function refusedCards(notes: Map<string, CardNote>): Map<string, string> {
   const result = new Map<string, string>()
   for (const [qq, note] of notes) if (note.why === 'refused') result.set(qq, note.card)

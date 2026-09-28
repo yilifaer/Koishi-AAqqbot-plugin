@@ -10,7 +10,11 @@ import { MAX_LIST_CHARS, MAX_LIST_LINES, MAX_MESSAGE_CHARS, normalizeId, splitMe
 /** 一次命令回复最多发几条（DECISIONS 第 43 条）。 */
 export const MAX_REPLY_PARTS = 5
 
+/** 不在运维名单里的人发命令：同一个人这么久之内只回一次（不然有人刷屏会把机器人发消息的队列堵住）。 */
+const DENY_REPLY_EVERY_MS = 3600_000
+
 export function registerCommands(ctx: Context, guard: Guard) {
+  const deniedAt = new Map<string, number>()
   const gate = async ({ session }: Argv) => {
     if (!session || session.platform !== 'onebot') return ''
     const admin = guard.adminGroup()
@@ -19,6 +23,10 @@ export function registerCommands(ctx: Context, guard: Guard) {
     if (!inPrivate && !inAdminGroup) return '' // 不回应
     const qq = normalizeId(session.userId)
     if (!qq || !guard.operators().has(qq)) {
+      const now = Date.now()
+      if (qq && now - (deniedAt.get(qq) ?? 0) < DENY_REPLY_EVERY_MS) return ''
+      if (deniedAt.size > 1000) deniedAt.clear()
+      if (qq) deniedAt.set(qq, now)
       await send(session, '你不在运维名单里，不能使用这个命令。')
       return ''
     }

@@ -2313,6 +2313,55 @@ describe('群里的提醒、移出公告、命令回复也拆小重发；任意�
     for (let i = 1; i < sends.length; i++) expect(sends[i].at - sends[i - 1].at).toBeGreaterThanOrEqual(gap - 5)
   })
 
+  it('排队等了一会儿才发的提醒：截止时间和提醒时间按真正发出的时间算', async () => {
+    await unbound('enforce')
+    ;(env.guard.platform as any).sendGapMs = 200
+    for (let i = 0; i < 2; i++) env.guard.notifier.push(`通知 ${i}：${'字'.repeat(1400)}`)
+    const flushing = env.guard.notifier.flush()
+    const reminding = env.guard.runReminders()
+    await sleep(50)
+    env.clock.now += HOUR // 排队的时候时间过去了
+    const sentAt = env.clock.now
+    await Promise.all([flushing, reminding])
+    const row = (await tracked('40001'))!
+    expect(row.lastRemindedAt!.getTime()).toBe(sentAt)
+    expect(row.graceUntil!.getTime()).toBe(sentAt + 48 * HOUR)
+  })
+
+  it('排队等着发的移出公告：这期间 aaqq.pause 了 → 不发', async () => {
+    await dueForKick()
+    ;(env.guard.platform as any).sendGapMs = 200
+    for (let i = 0; i < 3; i++) env.guard.notifier.push(`通知 ${i}：${'字'.repeat(1400)}`)
+    const flushing = env.guard.notifier.flush()
+    const patrolling = env.guard.runPatrol()
+    await sleep(100)
+    await env.guard.setPaused(true, OPERATOR)
+    await Promise.all([flushing, patrolling])
+    expect(env.qq.groupMessages(GROUP).filter((m) => m.text.includes('已被移出'))).toEqual([])
+  })
+
+  it('新人的提醒被拒、没发出去：运维群不说「已提醒」', async () => {
+    env = await setup()
+    await enableMode('remind')
+    env.qq.refuseSend = (text, target) => target === GROUP
+    env.qq.groups.get(GROUP)!.set('50001', plainMember('50001', '新人'))
+    await env.guard.handleNewMember(env.bot as any, GROUP, '50001')
+    const messages = (await env.adminMessages()).join('\n')
+    expect(messages).toContain('新成员 新人(50001)：不合格（没有在 AA 绑定 QQ），提醒没有发出去（没有定截止时间，不会因此被移出）')
+    expect(messages).not.toContain('已开始宽限并提醒')
+  })
+
+  it('不在运维名单里的人连着发命令：一小时内只回一次', async () => {
+    env = await setup()
+    const before = env.qq.sent.length
+    for (let i = 0; i < 3; i++) {
+      await env.say('66666', 'aaqq.status')
+      await sleep(200)
+    }
+    const replies = env.qq.sent.slice(before).filter((m) => m.target === '66666')
+    expect(replies.map((m) => m.text)).toEqual(['你不在运维名单里，不能使用这个命令。'])
+  })
+
   it('排队等着发的提醒：这期间 aaqq.pause 了 → 不发', async () => {
     await unbound('remind')
     ;(env.guard.platform as any).sendGapMs = 200

@@ -7,6 +7,9 @@ import { normalizeId, sleep } from './util'
 /** 机器人发的任意两条消息之间至少隔这么久（DECISIONS 第 63 条）。 */
 export const SEND_GAP_MS = 2000
 
+/** 发消息的队列：所有实例共用，插件重启后新旧实例也不会同时发。lastSentAt 是上一条发完（成功、失败、超时都算）的时间。 */
+const sending = { lastSentAt: 0, queue: Promise.resolve() as Promise<unknown> }
+
 export interface PendingJoinRequest {
   flag: string
   groupId: string
@@ -16,10 +19,6 @@ export interface PendingJoinRequest {
 }
 
 export class Platform {
-  /** 上一条消息发完（成功、失败、超时都算）的时间。 */
-  private lastSentAt = 0
-  private sendQueue: Promise<unknown> = Promise.resolve()
-
   constructor(private ctx: Context, private getBotId: () => string, private sendGapMs = SEND_GAP_MS) {}
 
   /** 所有机器人账号（任何平台），永远不处置。 */
@@ -99,24 +98,27 @@ export class Platform {
    */
   private paced(send: () => Promise<unknown>, ready?: () => boolean | Promise<boolean>): Promise<boolean> {
     const run = async () => {
-      const wait = this.lastSentAt + this.sendGapMs - Date.now()
+      const wait = sending.lastSentAt + this.sendGapMs - Date.now()
       if (wait > 0) await sleep(wait)
       if (ready && !(await ready())) return false
       try {
         await send()
         return true
       } finally {
-        this.lastSentAt = Date.now()
+        sending.lastSentAt = Date.now()
       }
     }
-    const result = this.sendQueue.then(run, run)
-    this.sendQueue = result.catch(() => {})
+    const result = sending.queue.then(run, run)
+    sending.queue = result.catch(() => {})
     return result
   }
 
-  /** 发到群里。返回 false 表示 ready 说不发了；发送失败时抛出错误（超时、拒收等）。 */
-  sendGroup(bot: Bot, groupId: string, content: Fragment, ready?: () => boolean | Promise<boolean>): Promise<boolean> {
-    return this.paced(() => bot.sendMessage(groupId, content), ready)
+  /**
+   * 发到群里。content 可以是一个函数：轮到这一条、ready 也通过之后才生成内容（例如提醒里的截止时间按真正发出的时间算）。
+   * 返回 false 表示 ready 说不发了；发送失败时抛出错误（超时、拒收等）。
+   */
+  sendGroup(bot: Bot, groupId: string, content: Fragment | (() => Fragment), ready?: () => boolean | Promise<boolean>): Promise<boolean> {
+    return this.paced(() => bot.sendMessage(groupId, typeof content === 'function' ? content() : content), ready)
   }
 
   /**
