@@ -556,13 +556,16 @@ describe('名片同步', () => {
     expect(plan.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true }])
   })
 
-  it('机器人只是管理员时，不改群主和其他管理员的名片，列进「改不了」', () => {
+  it('机器人只是管理员时，群主和其他管理员的名片也改（所有者实测，DECISIONS 第 44 条）', () => {
     const data = input('remind', [])
     data.verdicts.set('10000', verdict('10000', 'allow', 'OK', '[IGC] 群主'))
     data.verdicts.set('20000', verdict('20000', 'allow', 'OK', '[IGC] 管理'))
     const plan = planGroup(data)
-    expect(plan.cards).toEqual([])
-    expect(plan.adminCardsBlocked).toEqual([{ qq: '10000', to: '[IGC] 群主' }, { qq: '20000', to: '[IGC] 管理' }])
+    expect(plan.cards).toEqual([
+      { qq: '10000', from: '名片10000', to: '[IGC] 群主', why: 'sync', admin: true },
+      { qq: '20000', from: '名片20000', to: '[IGC] 管理', why: 'sync', admin: true },
+    ])
+    expect(plan.adminCardsBlocked).toEqual([])
   })
 
   it('机器人是群主：管理员的名片也改；白名单的永远不改', () => {
@@ -623,10 +626,10 @@ describe('群主、管理员的名片（K1）', () => {
     expect(plan.cards).toEqual([{ qq: '20000', from: '名片20000', to: '[IGC] 管理', why: 'sync', admin: true }])
   })
 
-  it('机器人是管理员：进 adminCardsBlocked，cards 为空', () => {
+  it('机器人是管理员：管理员名片也进 cards（admin）', () => {
     const plan = planGroup(withAdminCard())
-    expect(plan.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
-    expect(plan.cards).toEqual([])
+    expect(plan.cards).toEqual([{ qq: '20000', from: '名片20000', to: '[IGC] 管理', why: 'sync', admin: true }])
+    expect(plan.adminCardsBlocked).toEqual([])
   })
 
   it('机器人是普通成员：不改也不列', () => {
@@ -636,12 +639,14 @@ describe('群主、管理员的名片（K1）', () => {
   })
 
   it('同一张名片被 QQ 拒过：不再重试，列进 adminCardsBlocked；AA 名片变了就再试', () => {
-    const same = planGroup(withAdminCard({ botRole: 'owner', refusedCards: new Map([['20000', '[IGC] 管理']]) }))
-    expect(same.cards).toEqual([])
-    expect(same.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
-    const changed = planGroup(withAdminCard({ botRole: 'owner', refusedCards: new Map([['20000', '[IGC] 旧名片']]) }))
-    expect(changed.cards.map((c) => c.qq)).toEqual(['20000'])
-    expect(changed.adminCardsBlocked).toEqual([])
+    for (const botRole of ['owner', 'admin'] as const) {
+      const same = planGroup(withAdminCard({ botRole, refusedCards: new Map([['20000', '[IGC] 管理']]) }))
+      expect(same.cards).toEqual([])
+      expect(same.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
+      const changed = planGroup(withAdminCard({ botRole, refusedCards: new Map([['20000', '[IGC] 旧名片']]) }))
+      expect(changed.cards.map((c) => c.qq)).toEqual(['20000'])
+      expect(changed.adminCardsBlocked).toEqual([])
+    }
   })
 
   it('白名单、机器人自己、QQ 官方机器人、身份认不出来的：两边都没有', () => {
@@ -664,9 +669,11 @@ describe('群主、管理员的名片（K1）', () => {
     expect(plan.cardsPending).toBe(1)
   })
 
-  it('report 模式、机器人是管理员：照样列进 adminCardsBlocked（只报告）', () => {
+  it('report 模式、机器人是管理员：只计入「名片不一致」，不改也不列', () => {
     const plan = planGroup(withAdminCard({}, 'report'))
-    expect(plan.adminCardsBlocked).toEqual([{ qq: '20000', to: '[IGC] 管理' }])
+    expect(plan.cards).toEqual([])
+    expect(plan.adminCardsBlocked).toEqual([])
+    expect(plan.cardsPending).toBe(1)
   })
 
   it('关掉名片同步：管理员也不改、不列', () => {
@@ -719,13 +726,109 @@ describe('改成 off（planRelease）', () => {
     ['40009', tracked('40009')], // 不在名单里：不动
   ])
 
-  it('有标记的撤标记（改成功后才删记录），其余在场的人直接删记录', () => {
+  it('有标记的撤标记（改成功后才删记录，管理员身上的也撤），其余在场的人直接删记录', () => {
     const result = planRelease(members, rows, new Set(), 'admin', '【SPY】')
-    expect(result.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true }])
-    expect(result.untrack.sort()).toEqual(['40002', '40003'])
+    expect(result.cards).toEqual([
+      { qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true },
+      { qq: '40003', from: '【SPY】王五', to: '王五', why: 'unmark', untrackAfter: true, admin: true },
+    ])
+    expect(result.untrack).toEqual(['40002'])
   })
 
   it('机器人不是群主或管理员：什么都不做', () => {
     expect(planRelease(members, rows, new Set(), 'member', '【SPY】')).toEqual({ cards: [], untrack: [] })
+  })
+})
+
+describe('熔断按时间窗口累计（0.2.1 P1 / P3）', () => {
+  /** 3 个这一轮新出现的不合格 + 若干以前的跟踪记录。阈值 5。 */
+  function batch(rows: Array<[string, Partial<TrackedMember>]>, extra: Partial<PlanInput> = {}) {
+    const people: Array<[Member, Verdict]> = []
+    for (const qq of ['41001', '41002', '41003']) people.push([member(qq), verdict(qq, 'deny')])
+    for (const [qq] of rows) people.push([member(qq, { card: `【SPY】${qq}` }), verdict(qq, 'deny')])
+    return planGroup(input('remind', people, { tracked: new Map(rows.map(([qq, row]) => [qq, tracked(qq, row)])), ...extra }))
+  }
+  const recent = (qq: string, hoursAgo = 1): [string, Partial<TrackedMember>] => [qq, { activeSince: new Date(NOW - hoursAgo * HOUR) }]
+
+  it('最近 6 小时内已经开始处置的人也计数：3 + 3 > 5 → trip，breakerSet 包括之前那 3 人', () => {
+    const plan = batch([recent('40001'), recent('40002'), recent('40003')])
+    expect(plan.breaker).toBe('trip')
+    expect(plan.breakerReason).toBe('最近 6 小时内要开始处置的不合格成员有 6 人（这一轮 3 人、之前 3 人，超过阈值 5 人）')
+    expect(plan.breakerSet.sort()).toEqual(['40001', '40002', '40003', '41001', '41002', '41003'])
+    expect(plan.cards).toEqual([])
+  })
+
+  it('窗口外的（7 小时前）、经过冷静期批准的（不晚于上次冷静结束）、已经合格的，都不计数', () => {
+    expect(batch([recent('40001', 7), recent('40002', 7), recent('40003', 7)]).breaker).toBe('none')
+    expect(batch([recent('40001'), recent('40002'), recent('40003')], { releasedBefore: NOW - HOUR }).breaker).toBe('none')
+    const data = input('remind', [
+      [member('41001'), verdict('41001', 'deny')], [member('41002'), verdict('41002', 'deny')], [member('41003'), verdict('41003', 'deny')],
+      [member('40001'), verdict('40001', 'allow', 'OK', '名片40001')], [member('40002'), verdict('40002', 'allow', 'OK', '名片40002')],
+      [member('40003'), verdict('40003', 'allow', 'OK', '名片40003')],
+    ])
+    data.tracked = new Map(['40001', '40002', '40003'].map((qq) => [qq, tracked(qq, { activeSince: new Date(NOW - HOUR) })]))
+    expect(planGroup(data).breaker).toBe('none')
+  })
+
+  it('这一轮没有新的人要处置：窗口里的人再多也不 trip', () => {
+    const rows = ['40001', '40002', '40003', '40004', '40005', '40006'].map((qq) => recent(qq))
+    const people: Array<[Member, Verdict]> = rows.map(([qq]) => [member(qq, { card: `【SPY】${qq}` }), verdict(qq, 'deny')])
+    const plan = planGroup(input('remind', people, { tracked: new Map(rows.map(([qq, row]) => [qq, tracked(qq, row)])) }))
+    expect(plan.breaker).toBe('none')
+  })
+
+  it('移出也按窗口累计：这一轮到期 3 人 + 最近已经移出 3 人 > 5 → trip，0 移出；没人到期时不 trip', () => {
+    const people: Array<[Member, Verdict]> = []
+    const rows = new Map<string, TrackedMember>()
+    for (const qq of ['40001', '40002', '40003']) {
+      people.push([member(qq, { card: `【SPY】${qq}` }), verdict(qq, 'deny')])
+      rows.set(qq, tracked(qq, { graceUntil: new Date(NOW - 1) }))
+    }
+    const plan = planGroup(input('enforce', people, { tracked: rows, recentUnapprovedKicks: 3 }))
+    expect(plan.breaker).toBe('trip')
+    expect(plan.breakerReason).toBe('最近 6 小时内到期要移出的有 6 人（这一轮 3 人、已经移出 3 人，超过阈值 5 人）')
+    expect(plan.kicks).toEqual([])
+    expect(planGroup(input('enforce', [], { recentUnapprovedKicks: 5 })).breaker).toBe('none')
+  })
+
+  it('到期但最近没提醒过的人也计入熔断（P3）；冷静结束时清空他们的截止时间', () => {
+    const people: Array<[Member, Verdict]> = []
+    const rows = new Map<string, TrackedMember>()
+    for (let i = 0; i < 6; i++) {
+      const qq = String(40001 + i)
+      people.push([member(qq, { card: `【SPY】${qq}` }), verdict(qq, 'deny')])
+      rows.set(qq, tracked(qq, { graceUntil: new Date(NOW - 50 * HOUR), lastRemindedAt: new Date(NOW - 41 * HOUR) }))
+    }
+    const tripped = planGroup(input('enforce', people, { tracked: rows }))
+    expect(tripped.breaker).toBe('trip')
+    expect(tripped.kicks).toEqual([])
+    const released = planGroup(input('enforce', people, { tracked: rows, cooling: { since: NOW - 40 * HOUR, set: new Set(rows.keys()) } }))
+    expect(released.breaker).toBe('release')
+    expect(released.regraced).toBe(6)
+    expect(released.track.every((r) => r.graceUntil === null)).toBe(true)
+    expect(released.kicks).toEqual([])
+  })
+})
+
+describe('受保护的人身上残留的标记（0.2.1 P4）', () => {
+  it('管理员身上有标记：机器人是群主或管理员就撤掉（撤成功后删记录）', () => {
+    for (const botRole of ['owner', 'admin'] as const) {
+      const data = input('enforce', [[member('40001', { role: 'admin', card: '【SPY】张三' }), verdict('40001', 'deny')]], { botRole })
+      data.tracked = new Map([['40001', tracked('40001')]])
+      const plan = planGroup(data)
+      expect(plan.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true, admin: true }])
+      expect(plan.untrack).toEqual([])
+    }
+  })
+
+  it('report 模式也撤；白名单的人身上的也撤', () => {
+    const data = input('report', [
+      [member('40001', { role: 'admin', card: '【SPY】张三' }), verdict('40001', 'deny')],
+      [member('99999', { card: '【SPY】白名单' }), verdict('99999', 'deny')],
+    ])
+    data.tracked = new Map([['40001', tracked('40001')], ['99999', tracked('99999')]])
+    const plan = planGroup(data)
+    expect(plan.cards.map((c) => [c.qq, c.to, c.untrackAfter])).toEqual([['40001', '张三', true], ['99999', '白名单', true]])
+    expect(plan.untrack).toEqual([])
   })
 })

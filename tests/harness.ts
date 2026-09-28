@@ -265,9 +265,9 @@ export class FakeQQ {
         this.beforeCard?.(String(params.user_id))
         const m = group?.get(String(params.user_id))
         if (!m) return fail(1200)
-        // QQ 的规矩：群主能改管理员和普通成员；管理员只能改普通成员
+        // 机器人是群主或管理员时，谁的名片都能改（所有者实测，包括群主和其他管理员）；普通成员改不了别人的
         const self = group!.get(BOT)
-        if (self?.role === 'member' || (m.role !== 'member' && self?.role !== 'owner')) return fail(102)
+        if (self?.role === 'member') return fail(102)
         if (this.failCard.has(String(params.user_id))) return fail(102)
         m.card = params.card
         return ok()
