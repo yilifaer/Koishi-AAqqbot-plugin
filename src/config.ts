@@ -37,6 +37,8 @@ export interface Config {
   remindTime: string
   remindTemplate: string
   warnTemplate: string
+  markAdmins: boolean
+  adminRemindTemplate: string
   markCards: boolean
   markPrefix: string
   kickAnnounce: boolean
@@ -77,7 +79,7 @@ export const Config: Schema<Config> = Schema.intersect([
     operators: Schema.array(Schema.string()).role('table').default([])
       .description('运维名单（QQ 号）：只有名单里、并且 Koishi 权限等级 ≥ 3 的人能用管理命令。'),
     whitelist: Schema.array(Schema.string()).role('table').default([])
-      .description('白名单（QQ 号）：这些人永远不会被提醒、加标记或移出，名片也不改。机器人自己、群主、群管理员已自动保护（永远不会被提醒、加标记或移出），不用填。'),
+      .description('白名单（QQ 号）：这些人永远不会被提醒、加标记或移出，名片也不改。机器人自己已自动保护，不用填。群主、管理员永远不会被移出；他们不合格时加不加标记、提不提醒，看「宽限、提醒与标记」里的开关——想让某个管理员完全不被打扰，把他加进白名单。'),
   }).description('机器人与运维'),
 
   Schema.object({
@@ -122,6 +124,10 @@ export const Config: Schema<Config> = Schema.intersect([
       .description('remind 模式的提醒文字。`{list}` 是被 @ 的人和原因，`{url}` 是绑定网址。'),
     warnTemplate: Schema.string().role('textarea').default('以下成员还没有满足本群的要求，请在截止时间前在联盟 AA 完成 QQ 绑定，否则会被移出本群：{url}\n{list}')
       .description('enforce 模式的提醒文字。`{list}` 里会带上每个人的截止时间。'),
+    markAdmins: Schema.boolean().default(true)
+      .description('不合格的群主、管理员也加标记，并在每日提醒时单独 @ 他们（remind / enforce 模式）。他们**永远不会被移出**。关掉后，下一轮巡检撤掉他们身上的标记。白名单里的人不受影响。'),
+    adminRemindTemplate: Schema.string().role('textarea').default('以下群主/管理员还没有满足本群的要求（不会被移出），请尽快在联盟 AA 处理：{url}\n{list}')
+      .description('提醒不合格的群主、管理员时用的文字（没有截止时间）。`{list}` 是被 @ 的人和原因，`{url}` 是绑定网址。'),
     markCards: Schema.boolean().default(true)
       .description('给不合格的人的群名片前面加标记（remind / enforce 模式）。合格后自动改成 AA 给的名片。'),
     markPrefix: Schema.string().default('【SPY】')

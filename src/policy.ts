@@ -34,6 +34,8 @@ export interface PlanSettings {
   remindFreshMs: number
   /** 冷静期多长（毫秒）。 */
   cooldownMs: number
+  /** 不合格的群主、管理员也加标记、跟踪、提醒（永远不移出，DECISIONS 第 51 条）。 */
+  markAdmins?: boolean
 }
 
 /** 冷静期：since 开始时间；set 触发它的那批 QQ（null = 0.1.x 留下的熔断，名单未知）。 */
@@ -96,14 +98,17 @@ export type BreakerState = 'none' | 'trip' | 'cooling' | 'release' | 'restart'
 export interface Plan {
   /** 统计不含机器人自己。 */
   counts: { members: number; allow: number; deny: number; review: number; unknown: number }
-  /** 不受保护、判为 deny 的人（isNew：上一轮还没有记录）。 */
-  denies: Array<{ qq: string; reason: string; isNew: boolean }>
-  /** 判为 deny 但受保护（群主、管理员、白名单），永不处置，只报告。 */
+  /**
+   * 要处置的、判为 deny 的人（isNew：上一轮还没有记录）。
+   * staff：群主 / 管理员（markAdmins 打开时）——加标记、提醒，但永远不移出。
+   */
+  denies: Array<{ qq: string; reason: string; isNew: boolean; staff?: 'owner' | 'admin' }>
+  /** 判为 deny 但受保护（白名单、机器人；markAdmins 关掉时还有群主、管理员），不处置，只报告。 */
   protectedDenies: Array<{ qq: string; reason: string }>
   reviews: Array<{ qq: string; reason: string }>
   unknowns: string[]
   /** 报告里的「新发现不合格」：上一轮还没有记录的人。 */
-  newDenies: Array<{ qq: string; reason: string }>
+  newDenies: Array<{ qq: string; reason: string; staff?: 'owner' | 'admin' }>
   /** 这一轮第一次要被处置的人（没有记录，或记录还没处置过）：熔断按它计数。 */
   firstActions: Array<{ qq: string; reason: string }>
   threshold: number
@@ -142,6 +147,19 @@ export function breakerThreshold(groupSize: number, count: number, percent: numb
 /** 只有身份确定是普通成员、不是机器人、不在保护名单里的人才可能被处置。 */
 export function isProtected(member: Member, protectedIds: Set<string>): boolean {
   return member.role !== 'member' || member.isRobot || protectedIds.has(member.qq)
+}
+
+/**
+ * 群主或管理员，并且不是 QQ 官方机器人、不是机器人账号、不在白名单里。
+ * markAdmins 打开时他们不合格也加标记、提醒，但永远不移出（DECISIONS 第 51 条）。
+ */
+export function isStaff(member: Member, protectedIds: Set<string>): boolean {
+  return (member.role === 'owner' || member.role === 'admin') && !member.isRobot && !protectedIds.has(member.qq)
+}
+
+/** 完全不碰的人：受保护，并且不是「要加标记的群主 / 管理员」。 */
+export function isExempt(member: Member, protectedIds: Set<string>, markAdmins: boolean): boolean {
+  return isProtected(member, protectedIds) && !(markAdmins && isStaff(member, protectedIds))
 }
 
 export function botCanWrite(botRole: Role | null): boolean {
@@ -270,19 +288,21 @@ export function planGroup(input: PlanInput): Plan {
       if (record) settled.push(member)
     } else if (decision === 'deny') {
       plan.counts.deny++
-      if (prot) {
+      if (isExempt(member, input.protectedIds, !!settings.markAdmins)) {
         plan.protectedDenies.push({ qq: member.qq, reason: verdict!.reason })
         if (record) settled.push(member)
         continue
       }
-      plan.denies.push({ qq: member.qq, reason: verdict!.reason, isNew: !record })
-      if (!record) plan.newDenies.push({ qq: member.qq, reason: verdict!.reason })
+      // 普通成员，或者 markAdmins 打开时的群主 / 管理员（prot 为真，永远不移出）
+      const staff = prot ? { staff: member.role as 'owner' | 'admin' } : {}
+      plan.denies.push({ qq: member.qq, reason: verdict!.reason, isNew: !record, ...staff })
+      if (!record) plan.newDenies.push({ qq: member.qq, reason: verdict!.reason, ...staff })
       if (!record || !record.activeSince) plan.firstActions.push({ qq: member.qq, reason: verdict!.reason })
       denied.push({ member, verdict: verdict! })
       // 可以移出：enforce、完整巡检、截止时间已到、并且最近成功提醒过（截止时间是在提醒时定下的）
       const deadline = record?.graceUntil?.getTime()
       const remindedAt = record?.lastRemindedAt?.getTime()
-      if (mode === 'enforce' && settings.allowKicks && deadline !== undefined && deadline <= now) {
+      if (!prot && mode === 'enforce' && settings.allowKicks && deadline !== undefined && deadline <= now) {
         const fresh = remindedAt !== undefined && now - remindedAt <= settings.remindFreshMs
         due.push({ qq: member.qq, deadline, fresh })
         if (fresh) {
@@ -397,8 +417,10 @@ export function planGroup(input: PlanInput): Plan {
     const row: TrackedMember = existing ? { ...existing } : newRecord(input.groupId, member.qq, verdict.reason, now)
     row.reason = verdict.reason
     row.activeSince = existing?.activeSince ?? new Date(now)
+    // 群主 / 管理员：加标记、提醒，但永远没有截止时间、永远不移出
+    const staff = isProtected(member, input.protectedIds)
     // 截止时间只在 enforce 模式下、第一次成功发出带截止时间的提醒时定下（guard.sendReminder）
-    if (mode !== 'enforce') row.graceUntil = null
+    if (mode !== 'enforce' || staff) row.graceUntil = null
     // 冷静期结束时，截止时间已过、但冷静中没有提醒过的人：重新提醒后再算宽限期（DECISIONS 第 48 条）
     if (plan.breaker === 'release' && staleDue.has(member.qq) && row.graceUntil) {
       row.graceUntil = null
@@ -407,7 +429,7 @@ export function planGroup(input: PlanInput): Plan {
     if (settings.markCards && prefix) {
       if (member.card.startsWith(prefix)) {
         row.marked = true
-      } else if (canEditCard(input.botRole, member)) {
+      } else if (staff ? canSetCard(input.botRole, member) : canEditCard(input.botRole, member)) {
         marks.push({ qq: member.qq, from: member.card, to: markedCard(prefix, member), why: 'mark' })
         row.marked = true
       }
@@ -433,7 +455,8 @@ function planReport(input: PlanInput, plan: Plan) {
     const record = input.tracked.get(member.qq)
     const verdict = input.verdicts.get(member.qq)
     const decision = verdict?.decision ?? 'unknown'
-    const prot = isProtected(member, input.protectedIds)
+    // markAdmins 打开时，不合格的群主 / 管理员和普通成员一样只记录（DECISIONS 第 51 条）
+    const prot = isExempt(member, input.protectedIds, !!input.settings.markAdmins)
     const marked = !!record?.marked && !!prefix && member.card.startsWith(prefix)
     const keep = (decision === 'deny' && !prot) || (!!record && decision === 'unknown') // 这一行要留着（只记录）
     // 受保护的人身上的标记也撤（DECISIONS 第 49 条）

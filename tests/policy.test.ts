@@ -832,3 +832,49 @@ describe('受保护的人身上残留的标记（0.2.1 P4）', () => {
     expect(plan.untrack).toEqual([])
   })
 })
+
+describe('不合格的群主、管理员也加标记（0.2.2，markAdmins）', () => {
+  it('打开时：管理员进 denies（staff）、加标记、算第一次处置；enforce 下永远没有截止时间、永远不移出', () => {
+    const data = input('enforce', [[member('40001', { role: 'admin', card: '张三' }), verdict('40001', 'deny')]])
+    data.settings.markAdmins = true
+    data.tracked = new Map([['40001', tracked('40001', { graceUntil: new Date(NOW - 1), marked: false })]])
+    const plan = planGroup(data)
+    expect(plan.denies).toEqual([{ qq: '40001', reason: 'NOT_BOUND', isNew: false, staff: 'admin' }])
+    expect(plan.protectedDenies).toEqual([])
+    expect(plan.cards).toEqual([{ qq: '40001', from: '张三', to: '【SPY】张三', why: 'mark' }])
+    expect(plan.track[0]).toMatchObject({ qq: '40001', graceUntil: null, marked: true })
+    expect(plan.kicks).toEqual([])
+    expect(plan.kicksDue).toBe(0)
+  })
+
+  it('打开时：白名单、QQ 官方机器人、机器人自己照样完全不碰', () => {
+    const data = input('remind', [
+      [member('99999', { role: 'admin' }), verdict('99999', 'deny')],
+      [member('40001', { role: 'admin', isRobot: true }), verdict('40001', 'deny')],
+      [member(BOT, { role: 'admin' }), verdict(BOT, 'deny')],
+    ])
+    data.settings.markAdmins = true
+    const plan = planGroup(data)
+    expect(plan.denies).toEqual([])
+    expect(plan.cards).toEqual([])
+    expect(plan.protectedDenies.map((d) => d.qq)).toEqual(['99999', '40001'])
+  })
+
+  it('机器人只是管理员时，也给不合格的群主加标记', () => {
+    const data = input('remind', [])
+    data.settings.markAdmins = true
+    data.verdicts.set('10000', verdict('10000', 'deny'))
+    const plan = planGroup(data)
+    expect(plan.cards).toEqual([{ qq: '10000', from: '名片10000', to: '【SPY】名片10000', why: 'mark' }])
+    expect(plan.denies[0].staff).toBe('owner')
+  })
+
+  it('关掉时：和以前一样只报告，已有的标记撤掉', () => {
+    const data = input('remind', [[member('40001', { role: 'admin', card: '【SPY】张三' }), verdict('40001', 'deny')]])
+    data.settings.markAdmins = false
+    data.tracked = new Map([['40001', tracked('40001')]])
+    const plan = planGroup(data)
+    expect(plan.protectedDenies.map((d) => d.qq)).toEqual(['40001'])
+    expect(plan.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true, admin: true }])
+  })
+})
