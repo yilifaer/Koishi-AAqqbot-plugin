@@ -140,7 +140,8 @@ describe('remind 模式', () => {
     const plan = planGroup(input('remind', [[member('40001', { card: '张三' }), verdict('40001', 'deny')]]))
     expect(plan.writes).toBe(true)
     expect(plan.track).toHaveLength(1)
-    expect(plan.track[0]).toMatchObject({ qq: '40001', graceUntil: null, marked: true, reason: 'NOT_BOUND', activeSince: new Date(NOW) })
+    // marked 要等 QQ 确认改成功后才写（applyPlan）
+    expect(plan.track[0]).toMatchObject({ qq: '40001', graceUntil: null, marked: false, reason: 'NOT_BOUND', activeSince: new Date(NOW) })
     expect(plan.firstActions).toEqual([{ qq: '40001', reason: 'NOT_BOUND' }])
     expect(plan.cards).toEqual([{ qq: '40001', from: '张三', to: '【SPY】张三', why: 'mark' }])
     expect(plan.kicks).toEqual([])
@@ -841,8 +842,8 @@ describe('不合格的群主、管理员也加标记（0.2.2，markAdmins）', (
     const plan = planGroup(data)
     expect(plan.denies).toEqual([{ qq: '40001', reason: 'NOT_BOUND', isNew: false, staff: 'admin' }])
     expect(plan.protectedDenies).toEqual([])
-    expect(plan.cards).toEqual([{ qq: '40001', from: '张三', to: '【SPY】张三', why: 'mark' }])
-    expect(plan.track[0]).toMatchObject({ qq: '40001', graceUntil: null, marked: true })
+    expect(plan.cards).toEqual([{ qq: '40001', from: '张三', to: '【SPY】张三', why: 'mark', admin: true }])
+    expect(plan.track[0]).toMatchObject({ qq: '40001', graceUntil: null, marked: false })
     expect(plan.kicks).toEqual([])
     expect(plan.kicksDue).toBe(0)
   })
@@ -865,7 +866,7 @@ describe('不合格的群主、管理员也加标记（0.2.2，markAdmins）', (
     data.settings.markAdmins = true
     data.verdicts.set('10000', verdict('10000', 'deny'))
     const plan = planGroup(data)
-    expect(plan.cards).toEqual([{ qq: '10000', from: '名片10000', to: '【SPY】名片10000', why: 'mark' }])
+    expect(plan.cards).toEqual([{ qq: '10000', from: '名片10000', to: '【SPY】名片10000', why: 'mark', admin: true }])
     expect(plan.denies[0].staff).toBe('owner')
   })
 

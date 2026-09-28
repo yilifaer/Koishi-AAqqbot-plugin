@@ -36,6 +36,10 @@ export interface PlanSettings {
   cooldownMs: number
   /** 不合格的群主、管理员也加标记、跟踪、提醒（永远不移出，DECISIONS 第 51 条）。 */
   markAdmins?: boolean
+  /** 「离开联盟」类原因（AA 的原因码）：一发现就提醒，宽限 fastGraceMs（DECISIONS 第 52 条）。 */
+  fastReasons?: Set<string>
+  /** 「离开联盟」类原因的宽限时间（毫秒）。 */
+  fastGraceMs?: number
 }
 
 /** 冷静期：since 开始时间；set 触发它的那批 QQ（null = 0.1.x 留下的熔断，名单未知）。 */
@@ -138,6 +142,11 @@ export interface Plan {
   cardsPending: number
   /** 改不了的群主 / 管理员名片（K1）：同一张名片被 QQ 拒过（不再重试），或者机器人身份不够。 */
   adminCardsBlocked: Array<{ qq: string; to: string }>
+  /**
+   * 「离开联盟」的人：这一轮要马上发提醒（不等每日提醒，DECISIONS 第 52 条）。
+   * 只给单独离开的人；因为人太多触发过冷静期、冷静期结束时放行的那一批，照旧每日提醒、普通宽限期。
+   */
+  fastRemind: TrackedMember[]
 }
 
 export function breakerThreshold(groupSize: number, count: number, percent: number): number {
@@ -260,6 +269,7 @@ export function planGroup(input: PlanInput): Plan {
     kicksDeferred: 0,
     cardsPending: 0,
     adminCardsBlocked: [],
+    fastRemind: [],
   }
 
   const allowed: Array<{ member: Member; verdict: Verdict }> = []
@@ -335,9 +345,11 @@ export function planGroup(input: PlanInput): Plan {
   plan.kicksDue = kickable.length
   const hours = Math.round(settings.cooldownMs / 3600_000)
   const settledQqs = new Set(settled.map((m) => m.qq))
+  // 冷静中时，窗口固定在冷静开始的那一刻（不跟着时间往前滑）：只有真的有人变回合格，计数才会下降（DECISIONS 第 53 条）
+  const windowEnd = input.cooling ? input.cooling.since : now
   const recentActive = [...input.tracked.values()].filter((row) => {
     const at = row.activeSince?.getTime()
-    return at !== undefined && at > now - settings.cooldownMs && at <= now && at > input.releasedBefore
+    return at !== undefined && at > windowEnd - settings.cooldownMs && at <= now && at > input.releasedBefore
       && !settledQqs.has(row.qq) && !input.selfIds.has(row.qq)
   })
   const dueUnapproved = due.filter((k) => k.deadline > input.releasedBefore)
@@ -411,6 +423,8 @@ export function planGroup(input: PlanInput): Plan {
     }
   }
   const staleDue = new Set(due.filter((k) => !k.fresh).map((k) => k.qq))
+  const fastReasons = settings.fastReasons ?? new Set<string>()
+  const fastGraceMs = settings.fastGraceMs ?? 2 * 3600_000
 
   for (const { member, verdict } of denied) {
     const existing = input.tracked.get(member.qq)
@@ -430,9 +444,24 @@ export function planGroup(input: PlanInput): Plan {
       if (member.card.startsWith(prefix)) {
         row.marked = true
       } else if (staff ? canSetCard(input.botRole, member) : canEditCard(input.botRole, member)) {
-        marks.push({ qq: member.qq, from: member.card, to: markedCard(prefix, member), why: 'mark' })
-        row.marked = true
+        const to = markedCard(prefix, member)
+        if (staff && input.refusedCards.get(member.qq) === to) {
+          // 这张标记名片被 QQ 拒过：不再重试，运维群列一次（DECISIONS 第 55 条）
+          plan.adminCardsBlocked.push({ qq: member.qq, to })
+        } else {
+          // marked 等 QQ 确认改成功后才写（applyPlan）
+          marks.push({ qq: member.qq, from: member.card, to, why: 'mark', ...(staff ? { admin: true } : {}) })
+        }
+        row.marked = false
       }
+    }
+    // 「离开联盟」：单独离开的人马上提醒（冷静期结束时放行的那一批、以前冷静期批准过的人，走普通流程）
+    const approved = plan.breaker === 'release' || (!!existing?.activeSince && existing.activeSince.getTime() <= input.releasedBefore)
+    if (!staff && !approved && fastReasons.has(verdict.reason)) {
+      const needs = mode === 'enforce'
+        ? row.graceUntil === null || row.graceUntil.getTime() > now + fastGraceMs // 还没定过、或者定的是更晚的普通截止时间
+        : !existing?.activeSince || !fastReasons.has(existing.reason) // remind：刚开始处置，或者原因刚变成离开联盟
+      if (needs) plan.fastRemind.push(row)
     }
     plan.track.push(row)
   }
@@ -517,6 +546,6 @@ export function emptyPlan(): Plan {
     denies: [], protectedDenies: [], reviews: [], unknowns: [], newDenies: [], firstActions: [],
     threshold: 1, kicksDue: 0, breaker: 'none', breakerReason: '', breakerSet: [], breakerAdded: 0, regraced: 0,
     unknownHeavy: false, noRole: false, writes: false, track: [], untrack: [], cards: [], kicks: [],
-    kicksDeferred: 0, cardsPending: 0, adminCardsBlocked: [],
+    kicksDeferred: 0, cardsPending: 0, adminCardsBlocked: [], fastRemind: [],
   }
 }

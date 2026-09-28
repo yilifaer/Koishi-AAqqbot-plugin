@@ -237,6 +237,17 @@ export class Store {
     return new Map(rows.map((row) => [row.qq, normalizeTracked(row)]))
   }
 
+  /** 所有群里，原因在 reasons 里、截止时间晚于 after 的最早一个截止时间（毫秒）；没有就返回 null。 */
+  async nextDeadline(reasons: Set<string>, after: number): Promise<number | null> {
+    let next: number | null = null
+    for (const row of await this.db.get('aaqqbot_member', { graceUntil: { $gt: new Date(after) } })) {
+      if (!reasons.has(row.reason) || !row.graceUntil) continue
+      const at = new Date(row.graceUntil).getTime()
+      if (next === null || at < next) next = at
+    }
+    return next
+  }
+
   async saveTracked(rows: TrackedMember[]) {
     if (rows.length) await this.db.upsert('aaqqbot_member', rows)
   }
