@@ -11,6 +11,7 @@
 import { Bot, Context, Fragment, h, Logger, Session, Universal } from 'koishi'
 import { AaClient, ApiFailure, describeFailure, ManagedGroup, Verdict } from './aa'
 import { Config, Mode } from './config'
+import { classifySendError, describeSplit, HIDDEN_NAME, sendSplitting } from './delivery'
 import { Notifier } from './notifier'
 import { Platform } from './platform'
 import {
@@ -20,7 +21,7 @@ import { CardNote, extendModels, GroupState, isMode, Store, TrackedMember } from
 import { MODE_TEXT, reasonShort, rejectHint } from './texts'
 import {
   AbortedError, charLength, chunk, displayName, errorText, fillTemplate, formatDeadline, formatShortTime, isOneBotRefusal,
-  isOneBotTimeout, maskId, MAX_MESSAGE_CHARS, nextClockTime, normalizeId, normalizeIdList, ONEBOT_TIMEOUT_HINT, parseClock,
+  isOneBotTimeout, maskId, MAX_LIST_CHARS, nextClockTime, normalizeId, normalizeIdList, ONEBOT_TIMEOUT_HINT, parseClock,
   sleep, splitMessage, throwIfAborted,
 } from './util'
 
@@ -38,6 +39,8 @@ export interface GuardOptions {
   groupDelayMs?: number
   /** 一轮巡检跑满多久就停下，剩下的群接着巡检（测试用）。 */
   patrolSoftBudgetMs?: number
+  /** 机器人发的任意两条消息之间的间隔（默认 2 秒，DECISIONS 第 63 条）。 */
+  sendGapMs?: number
 }
 
 export interface ModeInfo {
@@ -157,7 +160,7 @@ export class Guard {
   constructor(private ctx: Context, public config: Config, private options: GuardOptions = {}) {
     this.logger = ctx.logger('aaqqbot')
     this.store = new Store(ctx, () => this.now())
-    this.platform = new Platform(ctx, () => this.config.botId)
+    this.platform = new Platform(ctx, () => this.config.botId, options.sendGapMs)
     this.aa = new AaClient(ctx, {
       baseUrl: config.aaBaseUrl,
       keyId: config.keyId.trim(),
@@ -1068,18 +1071,39 @@ export class Guard {
       const base = this.options.kickDelayMs ?? 3000
       await this.pause(base + Math.random() * base, signal)
     }
-    if (result.kicked.length && this.config.kickAnnounce) {
-      const list = result.kicked.map((k) => k.name).join('、')
-      const text = fillTemplate(this.config.kickAnnounceTemplate, { list, url: this.bindUrl() })
-      for (const part of splitMessage(text)) {
+    if (result.kicked.length && this.config.kickAnnounce) await this.announceKicks(bot, groupId, result.kicked.map((k) => k.name), signal)
+  }
+
+  /**
+   * 移出公告：每条最多 20 个名字、约 800 字；被 QQ 拒收时拆小重发，单独一个名字还被拒就隐藏这个名字（DECISIONS 第 62 条）。
+   * 超时、其他失败不重发（超时的其实可能已经发出去了，K11）。
+   */
+  private async announceKicks(bot: Bot, groupId: string, names: string[], signal: AbortSignal) {
+    const url = this.bindUrl()
+    const render = (part: string[]) => fillTemplate(this.config.kickAnnounceTemplate, { list: part.join('、'), url })
+    const batches: string[][] = []
+    for (const name of names) {
+      const last = batches[batches.length - 1]
+      if (last && last.length < REMIND_CHUNK && charLength(render([...last, name])) <= MAX_LIST_CHARS) last.push(name)
+      else batches.push([name])
+    }
+    for (const batch of batches) {
+      const report = await sendSplitting(batch, async (part) => {
+        const text = render(part)
         try {
-          await this.platform.sendGroup(bot, groupId, h.text(part))
+          // 长名字的公告可能超过 1500 字：照旧分段
+          for (const piece of splitMessage(text)) {
+            if (!(await this.platform.sendGroup(bot, groupId, h.text(piece), () => !signal.aborted && !this.paused))) return 'skipped'
+          }
+          return 'sent'
         } catch (error) {
-          // 不重发：超时的其实可能已经发出去了（K11）
-          this.logger.warn('发送移出公告失败 群 %s：%s%s', groupId, errorText(error), isOneBotTimeout(error) ? TIMEOUT_SUFFIX : '')
-          break
+          const kind = classifySendError(error)
+          this.logger.warn('发送移出公告失败 群 %s：%s%s', groupId, errorText(error), kind === 'timeout' ? TIMEOUT_SUFFIX : '')
+          return kind
         }
-      }
+      }, { hide: () => HIDDEN_NAME })
+      if (report.split) this.logger.warn('群 %s 的移出公告（%d 人）%s', groupId, batch.length, describeSplit(report))
+      if (!report.delivered) break
     }
   }
 
@@ -1614,12 +1638,12 @@ export class Guard {
     }
     const estimate = (part: TrackedMember[]) => charLength(head) + charLength(tail)
       + part.reduce((sum, row) => sum + AT_CHARS + charLength(entryText(row, this.now())), 0)
-    // 每批最多 20 人；一条消息估算超过上限就再对半拆
+    // 每批最多 20 人；一条消息估算超过约 800 字就再对半拆（名单分短，DECISIONS 第 62 条）
     const queue = chunk(rows, REMIND_CHUNK)
     const batches: TrackedMember[][] = []
     while (queue.length) {
       const part = queue.shift()!
-      if (part.length > 1 && estimate(part) > MAX_MESSAGE_CHARS) {
+      if (part.length > 1 && estimate(part) > MAX_LIST_CHARS) {
         const mid = Math.ceil(part.length / 2)
         queue.unshift(part.slice(0, mid), part.slice(mid))
         continue
@@ -1627,26 +1651,45 @@ export class Guard {
       batches.push(part)
     }
     const what = source === 'daily' ? '每日提醒' : source === 'fast' ? '离开联盟提醒' : '新人提醒'
-    for (const part of batches) {
-      if (!(await this.stillWritable(groupId, this.signal))) break
-      const now = this.now()
-      const updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
-      const content: Fragment[] = [h.text(head)]
-      for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
-      if (tail) content.push(h.text(tail))
-      try {
-        await this.platform.sendGroup(bot, groupId, content as any)
-      } catch (error) {
-        outcome.failed += part.length
-        if (isOneBotTimeout(error)) outcome.timedOut = true
-        this.logger.warn('发送提醒失败 群 %s：%s%s', groupId, errorText(error), isOneBotTimeout(error) ? TIMEOUT_SUFFIX : '')
-        continue
-      }
-      await this.store.markReminded(groupId, updated)
-      outcome.sent += part.length
-      outcome.reminded.push(...updated)
-      this.logger.info('已在群 %s 提醒 %d 人（%s）', groupId, part.length, what)
-      await this.store.audit('remind', groupId, '', `${part.length} 人（${what}）`)
+    let stopped = false
+    for (const batch of batches) {
+      if (stopped) break
+      let delivered = 0
+      let skipped = 0
+      // 被 QQ 拒收就对半拆开重发，只剩 1 人还被拒就算没提醒到（他不会因此被移出）
+      const report = await sendSplitting(batch, async (part) => {
+        if (stopped) {
+          skipped += part.length
+          return 'skipped'
+        }
+        const now = this.now()
+        const updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
+        const content: Fragment[] = [h.text(head)]
+        for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
+        if (tail) content.push(h.text(tail))
+        try {
+          // 排队等发的这段时间里可能暂停了或进入了冷静期：发之前再确认一次
+          if (!(await this.platform.sendGroup(bot, groupId, content as any, () => this.stillWritable(groupId, this.signal)))) {
+            stopped = true
+            skipped += part.length
+            return 'skipped'
+          }
+        } catch (error) {
+          const kind = classifySendError(error)
+          if (kind === 'timeout') outcome.timedOut = true
+          this.logger.warn('发送提醒失败 群 %s：%s%s', groupId, errorText(error), kind === 'timeout' ? TIMEOUT_SUFFIX : '')
+          return kind
+        }
+        await this.store.markReminded(groupId, updated)
+        delivered += part.length
+        outcome.reminded.push(...updated)
+        this.logger.info('已在群 %s 提醒 %d 人（%s）', groupId, part.length, what)
+        await this.store.audit('remind', groupId, '', `${part.length} 人（${what}）`)
+        return 'sent'
+      })
+      outcome.sent += delivered
+      outcome.failed += batch.length - delivered - skipped
+      if (report.split) this.logger.warn('群 %s 的%s（%d 人）%s', groupId, what, batch.length, describeSplit(report))
     }
     return outcome
   }

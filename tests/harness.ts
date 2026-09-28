@@ -208,7 +208,8 @@ export interface SentMessage {
 
 export class FakeQQ {
   groups = new Map<string, Map<string, FakeMember>>()
-  calls: Array<{ action: string; params: any }> = []
+  /** at：调用时间（真实时间，测消息间隔用）。 */
+  calls: Array<{ action: string; params: any; at: number }> = []
   sent: SentMessage[] = []
   requests: Array<{ flag: string; approve: boolean; reason: string }> = []
   failKick = new Set<string>()
@@ -221,8 +222,8 @@ export class FakeQQ {
   failSend = false
   /** 只让发往这些群的消息失败。 */
   failSendGroups = new Set<string>()
-  /** 模拟 QQ 内容审核：返回 true 的群消息被拒收（retcode 1200）。 */
-  refuseSend: ((text: string, groupId: string) => boolean) | null = null
+  /** 模拟 QQ 内容审核：返回 true 的消息被拒收（retcode 1200）。target 是群号或私聊对象的 QQ。 */
+  refuseSend: ((text: string, target: string) => boolean) | null = null
   systemMsg: any = { join_requests: [], invited_requests: [] }
   private messageId = 0
 
@@ -243,7 +244,7 @@ export class FakeQQ {
   }
 
   handle(action: string, params: any): { retcode: number; data: any; status?: string } {
-    this.calls.push({ action, params: JSON.parse(JSON.stringify(params ?? {})) })
+    this.calls.push({ action, params: JSON.parse(JSON.stringify(params ?? {})), at: Date.now() })
     if (this.timeoutActions.has(action)) throw new OneBot.TimeoutError(params, action)
     const ok = (data: any = null) => ({ status: 'ok', retcode: 0, data })
     const fail = (retcode = 1200) => ({ status: 'failed', retcode, data: null })
@@ -282,8 +283,9 @@ export class FakeQQ {
         const isGroup = action === 'send_group_msg'
         if (this.failSend || (isGroup && this.failSendGroups.has(String(params.group_id)))) return fail(1200)
         const flat = flatten(params.message)
-        if (isGroup && this.refuseSend?.(flat.text, String(params.group_id))) return fail(1200)
-        this.sent.push({ kind: isGroup ? 'group' : 'private', target: String(isGroup ? params.group_id : params.user_id), ...flat, raw: params.message })
+        const target = String(isGroup ? params.group_id : params.user_id)
+        if (this.refuseSend?.(flat.text, target)) return fail(1200)
+        this.sent.push({ kind: isGroup ? 'group' : 'private', target, ...flat, raw: params.message })
         return ok({ message_id: ++this.messageId })
       }
       case 'get_group_system_msg':
@@ -405,7 +407,7 @@ export async function setup(configPatch: Partial<Config> = {}, options: { start?
     name: 'aaqqbot-test',
     inject: ['database', 'http'],
     apply(ctx: Context) {
-      guard = new Guard(ctx, config, { timers: false, retryDelays: [], cardDelayMs: 0, kickDelayMs: 0, groupDelayMs: 0, now: () => clock.now })
+      guard = new Guard(ctx, config, { timers: false, retryDelays: [], cardDelayMs: 0, kickDelayMs: 0, groupDelayMs: 0, sendGapMs: 0, now: () => clock.now })
       guard.install()
       registerCommands(ctx, guard)
     },

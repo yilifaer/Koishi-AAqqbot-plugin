@@ -2137,6 +2137,117 @@ describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）'
   })
 })
 
+describe('群里的提醒、移出公告、命令回复也拆小重发；任意两条消息相隔 2 秒（0.2.4）', () => {
+  const HIDDEN = '（名字含 QQ 不允许的内容，已隐藏）'
+  const ats = (text: string) => text.match(/@\d+/g)?.length ?? 0
+  const people = Array.from({ length: 12 }, (_, i) => String(40001 + i))
+  const tracked = async (qq: string) => (await env.guard.store.tracked(GROUP)).get(qq)
+
+  /** 12 个没绑定的人；设好模式并巡检一轮（加上标记）。 */
+  async function unbound(mode: Mode) {
+    env = await setup({ breakerCount: 100, breakerPercent: 100 })
+    addMembers(...people)
+    await enableMode(mode)
+    await env.adminMessages()
+  }
+
+  /** 6 个已到期、刚提醒过的人（enforce）。 */
+  async function dueForKick(cards: Record<string, string> = {}) {
+    env = await setup({ breakerCount: 100, breakerPercent: 100 })
+    const due = people.slice(0, 6)
+    const group = env.qq.groups.get(GROUP)!
+    for (const qq of due) group.set(qq, plainMember(qq, `【SPY】${cards[qq] ?? `名片${qq}`}`))
+    const now = env.clock.now
+    await env.guard.store.saveTracked(due.map((qq) => ({
+      groupId: GROUP, qq, reason: 'NOT_BOUND', firstDeniedAt: new Date(now - 72 * HOUR), marked: true,
+      activeSince: new Date(now - 72 * HOUR), lastRemindedAt: new Date(now - HOUR), graceUntil: new Date(now - 60_000),
+    })))
+    setMode('enforce')
+    return due
+  }
+
+  it('每日提醒被拒（超过 5 个 @ 就拒）：拆小重发，12 个人都提醒到、都记了截止时间', async () => {
+    await unbound('enforce')
+    env.qq.refuseSend = (text, target) => target === GROUP && ats(text) > 5
+    await env.guard.runReminders()
+    const messages = env.qq.groupMessages(GROUP)
+    expect(messages.flatMap((m) => m.ats).sort()).toEqual(people)
+    for (const m of messages) expect(m.ats.length).toBeLessThanOrEqual(5)
+    for (const qq of people) expect((await tracked(qq))!.graceUntil).not.toBeNull()
+    expect((await env.adminMessages()).join('\n')).toContain('已提醒 12 人')
+  })
+
+  it('只 @ 某一个人也被拒：其他人照常提醒；这个人不算提醒过（不定截止时间，不会因此被移出），运维群有 ⚠', async () => {
+    await unbound('enforce')
+    env.qq.refuseSend = (text, target) => target === GROUP && text.includes('@40007')
+    await env.guard.runReminders()
+    const reminded = env.qq.groupMessages(GROUP).flatMap((m) => m.ats)
+    expect(reminded.sort()).toEqual(people.filter((qq) => qq !== '40007'))
+    expect((await tracked('40007'))!.lastRemindedAt).toBeNull()
+    expect((await tracked('40007'))!.graceUntil).toBeNull()
+    expect((await env.adminMessages()).join('\n')).toContain('提醒没有发出去（1 人）')
+  })
+
+  it('移出公告被拒（名字超过 2 个就拒）：拆小重发，6 个名字都公告了', async () => {
+    const due = await dueForKick()
+    env.qq.refuseSend = (text, target) => target === GROUP && (text.match(/、/g)?.length ?? 0) >= 2
+    await env.guard.runPatrol()
+    expect(env.qq.actions('set_group_kick')).toHaveLength(6)
+    const announced = env.qq.groupMessages(GROUP).filter((m) => m.text.includes('已被移出')).map((m) => m.text).join('\n')
+    for (const qq of due) expect(announced).toContain(`名片${qq}`)
+    expect(announced).not.toContain(HIDDEN)
+  })
+
+  it('移出公告里某个名字单独也被拒：只隐藏这个名字', async () => {
+    await dueForKick({ 40003: '坏词名字' })
+    env.qq.refuseSend = (text, target) => target === GROUP && text.includes('坏词')
+    await env.guard.runPatrol()
+    const announced = env.qq.groupMessages(GROUP).filter((m) => m.text.includes('已被移出')).map((m) => m.text).join('\n')
+    expect(announced).not.toContain('坏词')
+    expect(announced).toContain(HIDDEN)
+    for (const qq of ['40001', '40002', '40004', '40005', '40006']) expect(announced).toContain(`名片${qq}`)
+  })
+
+  it('命令回复被拒（私聊超过 3 行就拒）：拆小重发，内容一行不少', async () => {
+    env = await setup()
+    env.qq.refuseSend = (text, target) => target === OPERATOR && text.split('\n').length > 3
+    const before = env.qq.sent.length
+    await env.say(OPERATOR, 'aaqq')
+    await sleep(500)
+    const replies = env.qq.sent.slice(before).filter((m) => m.target === OPERATOR).map((m) => m.text)
+    expect(replies.length).toBeGreaterThan(1)
+    for (const r of replies) expect(r.split('\n').length).toBeLessThanOrEqual(3)
+    const all = replies.join('\n')
+    for (const command of ['aaqq.status', 'aaqq.health', 'aaqq.patrol', 'aaqq.confirm', 'aaqq.check', 'aaqq.pause', 'aaqq.resume']) expect(all).toContain(command)
+  })
+
+  it('任意两条消息之间至少隔开设定的时间：运维通知、群里的提醒、私聊回复排在一起一条一条地发', async () => {
+    await unbound('remind')
+    const gap = 150
+    ;(env.guard.platform as any).sendGapMs = gap
+    const start = env.qq.calls.length
+    for (let i = 0; i < 3; i++) env.guard.notifier.push(`通知 ${i}：${'字'.repeat(1400)}`)
+    await Promise.all([env.guard.notifier.flush(), env.guard.runReminders(), env.say(OPERATOR, 'aaqq')])
+    await sleep(gap * 3)
+    const sends = env.qq.calls.slice(start).filter((c) => c.action === 'send_group_msg' || c.action === 'send_private_msg')
+    expect(sends.length).toBeGreaterThanOrEqual(5)
+    for (let i = 1; i < sends.length; i++) expect(sends[i].at - sends[i - 1].at).toBeGreaterThanOrEqual(gap - 5)
+  })
+
+  it('排队等着发的提醒：这期间 aaqq.pause 了 → 不发', async () => {
+    await unbound('remind')
+    ;(env.guard.platform as any).sendGapMs = 200
+    for (let i = 0; i < 3; i++) env.guard.notifier.push(`通知 ${i}：${'字'.repeat(1400)}`)
+    const flushing = env.guard.notifier.flush()
+    const reminding = env.guard.runReminders()
+    await sleep(100)
+    await env.guard.setPaused(true, OPERATOR)
+    await Promise.all([flushing, reminding])
+    expect(env.qq.groupMessages(GROUP)).toEqual([])
+    expect((await tracked('40001'))!.lastRemindedAt).toBeNull()
+  })
+})
+
 describe('消息分段（K13）', () => {
   async function addGroups(count: number, nameLength: number) {
     for (let i = 0; i < count; i++) {
