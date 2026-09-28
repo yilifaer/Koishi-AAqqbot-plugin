@@ -1,7 +1,7 @@
 // 完整流程测试：真实的 Koishi + adapter-onebot，模拟的 AA 和 LLBot。
 // 对应交接文档 README §9.5 第 9–18 条、KOISHI_START 第 9 节。
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OneBot } from 'koishi-plugin-adapter-onebot'
 import type { Mode } from '../src/config'
 import { charLength } from '../src/util'
@@ -967,8 +967,8 @@ describe('通知', () => {
     await enableMode('remind')
     const messages = (await env.adminMessages()).join('\n')
     expect(messages.match(/白名单里有/g)).toHaveLength(1)
-    expect(messages).toContain('⚠ 白名单里有 1 条写得不对，没有生效：12345678 张三（每一条只能填一个 QQ 号）')
-    expect(await env.guard.statusText()).toContain('⚠ 白名单里有 1 条写得不对，没有生效：12345678 张三')
+    expect(messages).toContain('⚠ 白名单里有 1 条写得不对，没有生效（每一条只能填一个 QQ 号）：\n· 12345678 张三')
+    expect(await env.guard.statusText()).toContain('⚠ 白名单里有 1 条写得不对，没有生效（每一条只能填一个 QQ 号）：\n· 12345678 张三')
     expect(env.qq.member(GROUP, '40001')!.card).toBe('名片40001')
   })
 
@@ -2036,7 +2036,6 @@ describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）'
     expect(messages.some((m) => /^（\d+\/4-1）/.test(m))).toBe(true) // 例如（3/4-1）
     expect(messages.some((m) => /^（\d+\/4-2-2）/.test(m))).toBe(true) // 拆开后还被拒的再拆：（3/4-2-2）
     for (const m of messages) expect(listLines(m)).toBeLessThanOrEqual(10)
-    expect(adminSends().length).toBeLessThanOrEqual(30) // 被拒的那几次也计入每小时上限
   })
 
   it('某个名字单独一行也被拒：只有这一行的名字被隐藏，其他照常送达', async () => {
@@ -2049,6 +2048,8 @@ describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）'
     expect(all).not.toContain('坏词')
     expect(all).toContain(`· ${HIDDEN}(40025)`)
     expect(all.split(HIDDEN)).toHaveLength(2) // 只隐藏了一行
+    // 隐藏后重发的那条仍带序号，例如（2/4-1-2-1-1-2）
+    expect(messages.some((m) => new RegExp(`^（2/4(-\\d+)+）· ${HIDDEN}\\(40025\\)$`).test(m))).toBe(true)
     expect(messages.flatMap(names)).toEqual(names(text))
   })
 
@@ -2057,9 +2058,7 @@ describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）'
     env.qq.timeoutActions.add('send_group_msg')
     env.guard.notifier.push(report())
     await env.guard.notifier.flush()
-    const parts = adminSends().length
-    expect(parts).toBeGreaterThanOrEqual(4)
-    expect(parts).toBeLessThanOrEqual(5) // 每条只发一次
+    expect(adminSends()).toHaveLength(4) // 原来就是 4 条，每条只发一次
   })
 
   it('什么都被拒（例如机器人被禁言）：拆开重发也不超过每小时 30 条；一小时后的第一条说明之前有几条没发出', async () => {
@@ -2075,7 +2074,8 @@ describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）'
     env.clock.now += HOUR
     env.guard.notifier.push('测试通知')
     const [message] = await env.adminMessages()
-    expect(message).toMatch(/^（之前有 \d+ 条通知因为限速没有发出，请看 Koishi 日志）\n测试通知$/)
+    // 6 = 第 1 条拆出来的 2 段 + 后面 3 条 + 限速期间的「测试通知」
+    expect(message).toBe('（之前有 6 条通知因为限速没有发出，请看 Koishi 日志）\n测试通知')
   })
 
   it('拆出来的消息计入每小时上限：前面已经发了 26 条，被拒的那条只能再发 3 条，其余只写日志', async () => {
@@ -2109,6 +2109,85 @@ describe('运维通知被 QQ 拒收：主动分短 + 拆小重发（0.2.4 M1）'
     expect(messages).toHaveLength(2)
     expect(messages[0]).toMatch(/^（之前有 1 条通知因为限速没有发出，请看 Koishi 日志）\n（1\/1-1）· 名字40001\(40001\)/)
     expect(messages[1].startsWith('（1/1-2）')).toBe(true)
+  })
+
+  it('隐藏名字后仍被拒：只再试这一次，然后只写日志', async () => {
+    env = await setup()
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && text.includes('(40025)')
+    env.guard.notifier.push(report())
+    await env.guard.notifier.flush()
+    expect(adminSends().filter((c) => JSON.stringify(c.params).includes(HIDDEN))).toHaveLength(1)
+    expect(delivered().join('\n')).not.toContain('(40025)')
+    expect(delivered().flatMap(names)).toHaveLength(79)
+  })
+
+  it('日志写明哪一条被拆开、拆成几条、有没有全部送达', async () => {
+    env = await setup()
+    const warn = vi.spyOn(env.guard.logger, 'warn')
+    const logs = () => warn.mock.calls.map((c) => {
+      let i = 1
+      return String(c[0]).replace(/%[sd]/g, () => String(c[i++]))
+    })
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && listLines(text) > 10
+    env.guard.notifier.push(Array.from({ length: 20 }, (_, i) => `· 名字${40001 + i}(${40001 + i})`).join('\n'))
+    await env.guard.notifier.flush()
+    expect(logs()).toContain('运维通知「· 名字40001(40001)…」被 QQ 拒收，拆成 2 条重发，全部送达')
+    env.qq.refuseSend = (text, groupId) => groupId === ADMIN_GROUP && text.includes('禁止')
+    env.guard.notifier.push('【标题】禁止\n· 名字(40002)')
+    await env.guard.notifier.flush()
+    expect(logs()).toContain('运维通知（1/1-1）没有发出（被 QQ 拒收，没法再拆），只写日志：【标题】禁止')
+    expect(logs()).toContain('运维通知「【标题】禁止…」被 QQ 拒收，拆成 2 条重发，没有全部送达：1 条送达，1 条没发出（内容见前面的日志）')
+  })
+
+  it('带「之前有 N 条没发出」说明的那条超时：说明算已经发过，下一条不再重复', async () => {
+    env = await setup()
+    for (let i = 0; i < 30; i++) {
+      env.guard.notifier.push(`通知 ${i}`)
+      await env.guard.notifier.flush()
+    }
+    env.guard.notifier.push('这条被限速')
+    await env.guard.notifier.flush()
+    env.clock.now += HOUR
+    env.qq.timeoutActions.add('send_group_msg')
+    env.guard.notifier.push('超时的那条')
+    await env.guard.notifier.flush()
+    env.qq.timeoutActions.clear()
+    env.guard.notifier.push('下一条')
+    expect((await env.adminMessages()).at(-1)).toBe('下一条')
+  })
+
+  it('发往运维群的其他失败（不是拒收，例如连接断了）：不拆、只发一次', async () => {
+    env = await setup()
+    const original = env.qq.handle.bind(env.qq)
+    env.qq.handle = (action, params) => {
+      if (action === 'send_group_msg' && String(params.group_id) === ADMIN_GROUP) {
+        env.qq.calls.push({ action, params, at: Date.now() })
+        throw new Error('socket closed')
+      }
+      return original(action, params)
+    }
+    env.guard.notifier.push('· 张三(40001)\n· 李四(40002)\n· 王五(40003)')
+    await env.guard.notifier.flush()
+    expect(adminSends()).toHaveLength(1)
+  })
+
+  it('两轮发送同时开始（例如上一轮还没发完又来了新通知）：一轮一轮地发，「之前有 N 条没发出」只说一次', async () => {
+    env = await setup()
+    for (let i = 0; i < 32; i++) {
+      env.guard.notifier.push(`通知 ${i}`)
+      await env.guard.notifier.flush()
+    }
+    env.clock.now += HOUR
+    ;(env.guard.platform as any).sendGapMs = 100 // 让 A 还在排队发的时候 B 就来了
+    env.guard.notifier.push('A')
+    const first = env.guard.notifier.flush()
+    await sleep(20)
+    env.guard.notifier.push('B')
+    const second = env.guard.notifier.flush()
+    await Promise.all([first, second])
+    env.guard.notifier.push('C')
+    const messages = (await env.adminMessages()).slice(-3)
+    expect(messages).toEqual(['（之前有 2 条通知因为限速没有发出，请看 Koishi 日志）\nA', 'B', 'C'])
   })
 
   it('真的巡检：3 个群各 15 个没绑定的人，报告分成几条、每条最多 20 行名单，名字一个不少', async () => {

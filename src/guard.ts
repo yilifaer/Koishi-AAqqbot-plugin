@@ -337,7 +337,7 @@ export class Guard {
     await this.startStep('检查 adapter-onebot 设置', async () => this.checkOneBotConfig(this.pickBot()))
     await this.startStep('检查白名单', async () => {
       const bad = this.invalidWhitelist()
-      if (bad.length) this.notifier.push(`⚠ 白名单里有 ${bad.length} 条写得不对，没有生效：${bad.join('、')}（每一条只能填一个 QQ 号）`)
+      if (bad.length) this.notifier.push(badWhitelistText(bad))
     })
     await this.startStep('安排离开联盟的到期检查', () => this.scheduleFastKicks())
     await this.startStep('健康检查', () => this.checkHealth(true))
@@ -1101,7 +1101,13 @@ export class Guard {
           this.logger.warn('发送移出公告失败 群 %s：%s%s', groupId, errorText(error), kind === 'timeout' ? TIMEOUT_SUFFIX : '')
           return kind
         }
-      }, { hide: () => HIDDEN_NAME })
+      }, {
+        hide: () => HIDDEN_NAME,
+        onLost: (part, _, why) => {
+          if (why !== 'skipped') this.logger.warn('群 %s 的移出公告里这些名字没有发出：%s', groupId, part.join('、'))
+        },
+        onHidden: (name) => this.logger.warn('群 %s 的移出公告里「%s」被 QQ 拒收，已隐藏这个名字', groupId, name),
+      })
       if (report.split) this.logger.warn('群 %s 的移出公告（%d 人）%s', groupId, batch.length, describeSplit(report))
       if (!report.delivered) break
     }
@@ -1686,6 +1692,10 @@ export class Guard {
         this.logger.info('已在群 %s 提醒 %d 人（%s）', groupId, part.length, what)
         await this.store.audit('remind', groupId, '', `${part.length} 人（${what}）`)
         return 'sent'
+      }, {
+        onLost: (part, _, why) => {
+          if (why === 'refused') this.logger.warn('群 %s 的%s被 QQ 拒收，单独 @ 也发不出去，这些人没提醒到：%s', groupId, what, part.map((row) => maskId(row.qq)).join('、'))
+        },
       })
       outcome.sent += delivered
       outcome.failed += batch.length - delivered - skipped
@@ -1858,7 +1868,7 @@ export class Guard {
     lines.push(`AA：${this.aaDown ? '❌ 最近一次请求失败' : '正常'}${this.aa.clockSkewMs !== null ? `（时间差 ${Math.round(this.aa.clockSkewMs / 1000)} 秒）` : ''}`)
     if (this.adminGroupConflict) lines.push('❌ 运维群同时是受管群，已停止发送运维通知，请修改配置')
     const badWhitelist = this.invalidWhitelist()
-    if (badWhitelist.length) lines.push(`⚠ 白名单里有 ${badWhitelist.length} 条写得不对，没有生效：${badWhitelist.join('、')}`)
+    if (badWhitelist.length) lines.push(badWhitelistText(badWhitelist))
     if (this.lastRound) lines.push(`上次巡检：${formatShortTime(this.lastRound.at)}${this.lastRound.ok ? '' : '（有问题）'}`)
     if (this.patrolRunning) lines.push('正在巡检中')
     else if (this.nextPatrolAt) lines.push(`下次巡检：${formatShortTime(this.nextPatrolAt)}`)
@@ -1920,6 +1930,11 @@ export class Guard {
 }
 
 /** 名片记录里被 QQ 拒过的：QQ → 那张 AA 名片（同一张不再重试）。 */
+/** 白名单里写得不对的条目：一条一行（名单分短、被拒时拆开都按行来，DECISIONS 第 62 条）。 */
+function badWhitelistText(bad: string[]): string {
+  return [`⚠ 白名单里有 ${bad.length} 条写得不对，没有生效（每一条只能填一个 QQ 号）：`, ...bad.map((entry) => `· ${entry}`)].join('\n')
+}
+
 function refusedCards(notes: Map<string, CardNote>): Map<string, string> {
   const result = new Map<string, string>()
   for (const [qq, note] of notes) if (note.why === 'refused') result.set(qq, note.card)

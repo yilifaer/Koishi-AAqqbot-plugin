@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { OneBot } from 'koishi-plugin-adapter-onebot'
+import { describeSplit, renderLines, SendResult, sendSplitting, textLines } from '../src/delivery'
 import { HIDDEN_NAME, hideNames, pack } from '../src/notifier'
 import {
   charLength, cleanName, countListLines, displayName, isListLine, isOneBotRefusal, isOneBotTimeout, MAX_LIST_CHARS, MAX_LIST_LINES,
@@ -162,6 +163,25 @@ describe('运维通知打包：名单（0.2.4 M1）', () => {
     expect(messages.join('\n\n')).toBe(items.join('\n\n'))
   })
 
+  it('一份 40 行短名单（字数不到 800）：照样按每条最多 20 行名单切开', () => {
+    const report = Array.from({ length: 40 }, (_, i) => `· 张三${40001 + i}(${40001 + i})`).join('\n')
+    expect(charLength(report)).toBeLessThan(MAX_LIST_CHARS)
+    const messages = pack([report])
+    expect(messages.length).toBeGreaterThanOrEqual(2)
+    for (const m of messages) expect(countListLines(m)).toBeLessThanOrEqual(MAX_LIST_LINES)
+  })
+
+  it('序号也算在 800 字里：切成 10 条以上、序号两位数时每条仍不超过 800 字', () => {
+    const report = Array.from({ length: 200 }, (_, i) => `· ${'名'.repeat(40)}(${40001 + i})`).join('\n')
+    const messages = pack([report])
+    expect(messages.length).toBeGreaterThanOrEqual(10)
+    for (const m of messages) expect(charLength(m)).toBeLessThanOrEqual(MAX_LIST_CHARS)
+  })
+
+  it('一行里有好几个「名字(QQ号)」：按好几行名单算', () => {
+    expect(countListLines('· 张三(12345678)、李四(23456789)\n· 王五(34567890)')).toBe(3)
+  })
+
   it('没有名单的短通知照旧合并成 1 条', () => {
     const items = Array.from({ length: 10 }, (_, i) => `ℹ 第 ${i} 条通知 ${'字'.repeat(60)}`)
     expect(pack(items)).toHaveLength(1)
@@ -173,9 +193,18 @@ describe('隐藏名字（0.2.4 M1）', () => {
     expect(hideNames('· 坏词张三(40001)（群主，不移出）')).toBe(`· ${HIDDEN_NAME}(40001)（群主，不移出）`)
   })
 
-  it('⚡ 那一行：开头的符号保留，名字前面的群名一起隐藏', () => {
+  it('⚡ 那一行：开头的符号、群名、后面的说明都保留，只隐藏名字', () => {
     expect(hideNames('⚡ 联盟聊天群（111111111） 坏词张三(40001) 已不具备成员资格（AA 账号没有成员资格），已提醒'))
-      .toBe(`⚡ ${HIDDEN_NAME}(40001) 已不具备成员资格（AA 账号没有成员资格），已提醒`)
+      .toBe(`⚡ 联盟聊天群（111111111） ${HIDDEN_NAME}(40001) 已不具备成员资格（AA 账号没有成员资格），已提醒`)
+  })
+
+  it('一行里有好几个名字（用「：」「、」隔开）：每个名字都隐藏，前面的说明保留', () => {
+    expect(hideNames('⚠ 没有生效：张三(12345678)、李四(23456789)（每一条只能填一个 QQ 号）'))
+      .toBe(`⚠ 没有生效：${HIDDEN_NAME}(12345678)、${HIDDEN_NAME}(23456789)（每一条只能填一个 QQ 号）`)
+  })
+
+  it('名字里自己带括号：整个名字都隐藏', () => {
+    expect(hideNames('· 张三(备注)(40001)')).toBe(`· ${HIDDEN_NAME}(40001)`)
   })
 
   it('名片那一行：箭头后面要改成的名片也隐藏', () => {
@@ -183,7 +212,7 @@ describe('隐藏名字（0.2.4 M1）', () => {
   })
 
   it('emoji 开头、名字里有空格', () => {
-    expect(hideNames('👋 联盟聊天群（111111111） 新成员 [IGC] Kaela Voss(40001)：合格。')).toBe(`👋 ${HIDDEN_NAME}(40001)：合格。`)
+    expect(hideNames('👋 联盟聊天群（111111111） 新成员 [IGC] Kaela Voss(40001)：合格。')).toBe(`👋 联盟聊天群（111111111） 新成员 ${HIDDEN_NAME}(40001)：合格。`)
   })
 
   it('没有 QQ 号的行：没有名字可以隐藏', () => {
@@ -192,3 +221,70 @@ describe('隐藏名字（0.2.4 M1）', () => {
   })
 })
 
+
+describe('拆小重发（0.2.4 M1）', () => {
+  /** 模拟发送：refuse 返回 true 的就拒收，记下每次发了什么。 */
+  function sender(refuse: (part: string[]) => boolean) {
+    const sent: string[] = []
+    const tried: string[] = []
+    const send = async (part: string[], label: string): Promise<SendResult> => {
+      const text = renderLines(part, label)
+      tried.push(text)
+      if (refuse(part)) return 'refused'
+      sent.push(text)
+      return 'sent'
+    }
+    return { sent, tried, send }
+  }
+
+  it('被拒就对半拆开，直到送达；序号接着原来的编', async () => {
+    const lines = Array.from({ length: 8 }, (_, i) => `· 名字${i}(${40001 + i})`)
+    const { sent, send } = sender((part) => part.length > 2)
+    const report = await sendSplitting(lines, send, { label: '3/4', hide: hideNames })
+    expect(sent.map((t) => t.slice(0, 9))).toEqual(['（3/4-1-1）', '（3/4-1-2）', '（3/4-2-1）', '（3/4-2-2）'])
+    expect(sent.flatMap((t) => t.match(/\(\d+\)/g))).toEqual(lines.map((l) => l.match(/\(\d+\)/)![0]))
+    expect(report).toMatchObject({ split: true, halved: true, pieces: 4, delivered: 4, lost: 0, hidden: 0 })
+    expect(describeSplit(report)).toBe('被 QQ 拒收，拆成 4 条重发，全部送达')
+  })
+
+  it('原来没有序号的：拆出来是（1/1-1）（1/1-2）', async () => {
+    const { sent, send } = sender((part) => part.length > 1)
+    await sendSplitting(['第一行', '第二行'], send, { hide: hideNames })
+    expect(sent).toEqual(['（1/1-1）第一行', '（1/1-2）第二行'])
+  })
+
+  it('单独一行还被拒：隐藏名字后只再发一次；还被拒就放弃，交给 onLost 写日志（给的是原来的内容）', async () => {
+    const lost: Array<[string[], string, SendResult]> = []
+    const { tried, send } = sender((part) => part.some((line) => line.includes('(40002)')))
+    const report = await sendSplitting(['· 甲(40001)', '· 乙(40002)'], send, { label: '1/2', hide: hideNames, onLost: (...args) => lost.push(args) })
+    expect(tried.filter((t) => t.includes(HIDDEN_NAME))).toHaveLength(1)
+    expect(lost).toEqual([[['· 乙(40002)'], '1/2-2', 'refused']])
+    expect(report).toMatchObject({ pieces: 2, delivered: 1, lost: 1, hidden: 0 })
+    expect(describeSplit(report)).toBe('被 QQ 拒收，拆成 2 条重发，没有全部送达：1 条送达，1 条没发出（内容见前面的日志）')
+  })
+
+  it('只有 1 行的消息被拒、又没有名字可以隐藏：说「没法拆开」，不说拆成几条', async () => {
+    const { send } = sender(() => true)
+    const report = await sendSplitting(['✅ AA 已恢复连接。'], send, { hide: hideNames })
+    expect(describeSplit(report)).toBe('被 QQ 拒收，只有 1 行，没法拆开，没有全部送达：0 条送达，1 条没发出（内容见前面的日志）')
+  })
+
+  it('超时、其他失败都不拆', async () => {
+    for (const result of ['timeout', 'failed', 'capped'] as const) {
+      let calls = 0
+      const report = await sendSplitting(['一', '二', '三'], async () => {
+        calls++
+        return result
+      })
+      expect(calls).toBe(1)
+      expect(report.split).toBe(false)
+    }
+  })
+
+  it('序号和各行拆开再拼回去：内容不变，小节之间的空行还在', () => {
+    const text = '（2/3）标题\n\n【分类】\n· 甲(40001)\n\n· 乙(40002)'
+    const { label, lines } = textLines(text)
+    expect(label).toBe('2/3')
+    expect(renderLines(lines, label)).toBe(text)
+  })
+})

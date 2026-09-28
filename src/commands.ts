@@ -40,7 +40,11 @@ export function registerCommands(ctx: Context, guard: Guard) {
         guard.logger.warn('命令回复发送失败：%s', error)
         return classifySendError(error)
       }
-    }, { label, hide: hideNames })
+    }, {
+      label,
+      hide: hideNames,
+      onLost: (part, sub) => guard.logger.warn('命令回复（%s）没有发出，只写日志：%s', sub || '1/1', renderLines(part, '').replace(/\n+/g, ' | ')),
+    })
     if (report.split) guard.logger.warn('命令回复%s%s', label ? `（${label}）` : '', describeSplit(report))
   }
 

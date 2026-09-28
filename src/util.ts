@@ -173,10 +173,15 @@ export const MAX_LIST_LINES = 20
 export const MAX_LIST_CHARS = 800
 
 /** 名单行：带「(QQ号)」的行，例如「· 张三(12345678)」「⚡ … 张三(12345678) 已不具备成员资格…」。 */
-const LIST_LINE = /\(\d{5,12}\)/
+const LIST_ENTRY = /\(\d{5,12}\)/g
 
 export function isListLine(line: string): boolean {
-  return LIST_LINE.test(line)
+  return listEntries(line) > 0
+}
+
+/** 一段文字里有几个「名字(QQ号)」。一行里有好几个的按好几行名单算。 */
+function listEntries(text: string): number {
+  return text.match(LIST_ENTRY)?.length ?? 0
 }
 
 /** 带名单的消息的额外上限：lines 行名单、chars 字。 */
@@ -203,9 +208,9 @@ export function splitMessage(text: string, max = MAX_MESSAGE_CHARS, list?: ListL
   return parts.map((part, index) => `（${index + 1}/${parts.length}）${part}`)
 }
 
-/** 一段文字里的名单行数。 */
+/** 一段文字里的名单行数（一行里有好几个「名字(QQ号)」的按好几行算）。 */
 export function countListLines(text: string): number {
-  return text.split('\n').filter(isListLine).length
+  return listEntries(text)
 }
 
 /** length 字、listLines 行名单的一条消息是否在上限之内。 */
@@ -218,7 +223,7 @@ function splitInto(text: string, limit: number, list?: ListLimits): string[] {
   // 先拆成「单元」：小节（空行分隔）→ 太长（或名单太多）的小节再拆成行 → 太长的行再硬切
   const units: Array<{ text: string; sep: string; length: number; listLines: number }> = []
   const add = (piece: string, sep: string) => {
-    units.push({ text: piece, sep, length: charLength(piece), listLines: isListLine(piece) ? 1 : 0 })
+    units.push({ text: piece, sep, length: charLength(piece), listLines: listEntries(piece) })
   }
   text.split(/\n{2,}/).forEach((block, blockIndex) => {
     const blockSep = blockIndex === 0 ? '' : '\n\n'
