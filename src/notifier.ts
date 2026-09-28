@@ -1,13 +1,18 @@
 // 发到运维群的通知：短时间内的多条合并成一条、全局限速、发送失败只记日志（交接文档 R18）。
 // 所有内容都按纯文本发送（h.text），名片、群名、错误信息里的 <at> 之类不会被当成消息元素。
+//
+// 发送失败都不自动重发（运维通知、群里的提醒和公告都一样，DECISIONS 第 41 条）：
+// LLBot 响应超时的那一条其实可能已经送达，重发会刷屏。
+// 每条消息不超过 1500 字；一份通知太长时在空行 / 换行处分成几条，每条开头带（1/N）序号（DECISIONS 第 43 条）。
 
 import { h, Logger } from 'koishi'
 import type { Platform } from './platform'
-import { normalizeId } from './util'
+import { charLength, isOneBotTimeout, MAX_MESSAGE_CHARS, normalizeId, splitMessage } from './util'
 
-const MAX_MESSAGE_CHARS = 1500
 const MAX_MESSAGES_PER_HOUR = 30
 const FLUSH_DELAY_MS = 3000
+/** 给「之前有 N 条没发出」的说明留出位置。 */
+const PACK_LIMIT = MAX_MESSAGE_CHARS - 40
 
 export class Notifier {
   private queue: string[] = []
@@ -26,7 +31,7 @@ export class Notifier {
 
   /** 排队一条通知；几秒内的通知合并发送。 */
   push(text: string) {
-    this.logger.info('%s', text.replace(/\n/g, ' | '))
+    this.logger.info('%s', text.replace(/\n+/g, ' | '))
     if (!this.getAdminGroup()) return
     this.queue.push(text)
     if (!this.timer) this.timer = setTimeout(() => void this.flush(), FLUSH_DELAY_MS)
@@ -73,42 +78,36 @@ export class Notifier {
       if (this.history.length > 50) this.history.shift()
       await this.platform.sendGroup(bot, groupId, h.text(text))
     } catch (error) {
-      this.logger.warn('运维通知发送失败：%s', error)
+      if (isOneBotTimeout(error)) this.logger.warn('运维通知可能已经送达（LLBot 响应超时），不会重发')
+      else this.logger.warn('运维通知发送失败：%s', error)
     }
   }
 }
 
-/** 按行把多条通知拼成若干条不超过上限的消息。 */
-export function pack(items: string[]): string[] {
+/**
+ * 把几条通知拼成若干条不超过上限的消息。
+ * 短通知合并成一条（不加序号）；一份太长的通知单独切成几条，序号按这一份计（1/3、2/3、3/3）。
+ */
+export function pack(items: string[], limit = PACK_LIMIT): string[] {
   const messages: string[] = []
   let current = ''
+  const flush = () => {
+    if (current) messages.push(current)
+    current = ''
+  }
   for (const item of items) {
-    for (const piece of splitLong(item)) {
-      if (current && current.length + 2 + piece.length > MAX_MESSAGE_CHARS) {
-        messages.push(current)
-        current = ''
-      }
-      current = current ? `${current}\n\n${piece}` : piece
+    const parts = splitMessage(item, limit)
+    if (parts.length > 1) {
+      flush()
+      messages.push(...parts)
+      continue
     }
+    const piece = parts[0]
+    if (current && charLength(current) + 2 + charLength(piece) > limit) flush()
+    current = current ? `${current}\n\n${piece}` : piece
   }
-  if (current) messages.push(current)
+  flush()
   return messages
-}
-
-function splitLong(text: string): string[] {
-  if (text.length <= MAX_MESSAGE_CHARS) return [text]
-  const pieces: string[] = []
-  let current = ''
-  for (const line of text.split('\n')) {
-    const safeLine = line.length > MAX_MESSAGE_CHARS ? line.slice(0, MAX_MESSAGE_CHARS - 1) + '…' : line
-    if (current && current.length + 1 + safeLine.length > MAX_MESSAGE_CHARS) {
-      pieces.push(current)
-      current = ''
-    }
-    current = current ? `${current}\n${safeLine}` : safeLine
-  }
-  if (current) pieces.push(current)
-  return pieces
 }
 
 /** 运维群号：规范化后返回；没填返回 null。 */
