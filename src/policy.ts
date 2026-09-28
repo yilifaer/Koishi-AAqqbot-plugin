@@ -63,6 +63,11 @@ export interface PlanInput {
   recentUnapprovedKicks?: number
   /** members 只是群里的一部分人（事件、新人、提醒），或者名单可能不完整。 */
   partial: boolean
+  /**
+   * 这些原因的不合格只报告、不处置（不加标记、不提醒、不移出）。这个群的名单还没核对通过时，「待验证」的人
+   * 很可能是被漏掉的老成员（DECISIONS 第 65 条）。
+   */
+  holdReasons?: Set<string>
   /** 群的总人数，用来算熔断阈值。 */
   groupSize: number
   members: Member[]
@@ -109,6 +114,8 @@ export interface Plan {
   denies: Array<{ qq: string; reason: string; isNew: boolean; staff?: 'owner' | 'admin' }>
   /** 判为 deny 但受保护（白名单、机器人；markAdmins 关掉时还有群主、管理员），不处置，只报告。 */
   protectedDenies: Array<{ qq: string; reason: string }>
+  /** 只报告、不处置的不合格（holdReasons）。 */
+  heldDenies: Array<{ qq: string; reason: string }>
   reviews: Array<{ qq: string; reason: string }>
   unknowns: string[]
   /** 报告里的「新发现不合格」：上一轮还没有记录的人。 */
@@ -250,6 +257,7 @@ export function planGroup(input: PlanInput): Plan {
     counts: { members: 0, allow: 0, deny: 0, review: 0, unknown: 0 },
     denies: [],
     protectedDenies: [],
+    heldDenies: [],
     reviews: [],
     unknowns: [],
     newDenies: [],
@@ -277,6 +285,7 @@ export function planGroup(input: PlanInput): Plan {
 
   const allowed: Array<{ member: Member; verdict: Verdict }> = []
   const denied: Array<{ member: Member; verdict: Verdict }> = []
+  const held: Array<{ member: Member; verdict: Verdict }> = []
   const settled: Member[] = [] // 有跟踪记录、现在合格 / 需人工 / 受保护的人
   const kickable: Array<KickPlan & { deadline: number }> = []
   /** 截止时间已到的人（不管最近有没有提醒过）：熔断按它计数（DECISIONS 第 48 条）。 */
@@ -304,6 +313,11 @@ export function planGroup(input: PlanInput): Plan {
       if (isExempt(member, input.protectedIds, !!settings.markAdmins)) {
         plan.protectedDenies.push({ qq: member.qq, reason: verdict!.reason })
         if (record) settled.push(member)
+        continue
+      }
+      if (!prot && input.holdReasons?.has(verdict!.reason)) {
+        plan.heldDenies.push({ qq: member.qq, reason: verdict!.reason })
+        held.push({ member, verdict: verdict! })
         continue
       }
       // 普通成员，或者 markAdmins 打开时的群主 / 管理员（prot 为真，永远不移出）
@@ -407,7 +421,7 @@ export function planGroup(input: PlanInput): Plan {
 
   if (!plan.writes) {
     if (mode === 'report') planReport(input, plan)
-    else planRecordOnly(input, plan, denied, plan.cardWrites ? { settled, syncs } : null)
+    else planRecordOnly(input, plan, denied, held, plan.cardWrites ? { settled, syncs } : null)
     return plan
   }
 
@@ -444,6 +458,7 @@ export function planGroup(input: PlanInput): Plan {
     plan.track.push(row)
   }
 
+  planHeld(input, plan, held, marks)
   plan.cards = [...marks, ...syncs]
   const budget = Math.max(0, settings.kickBudget)
   plan.kicks = kickable.slice(0, budget).map(({ qq, reason, name }) => ({ qq, reason, name }))
@@ -502,6 +517,23 @@ function planSettled(input: PlanInput, plan: Plan, settled: Member[], syncs: Car
   }
 }
 
+/**
+ * 只报告、不处置的不合格（holdReasons）：记录成「只记录」行（不提醒、不移出，也不算开始处置），
+ * 以前加的标记撤掉（marks 为 null 时这一轮不改名片）。
+ */
+function planHeld(input: PlanInput, plan: Plan, held: Array<{ member: Member; verdict: Verdict }>, marks: CardChange[] | null) {
+  const prefix = input.settings.markPrefix
+  for (const { member, verdict } of held) {
+    const record = input.tracked.get(member.qq)
+    const marked = !!record?.marked && !!prefix && member.card.startsWith(prefix)
+    plan.track.push({
+      ...(record ?? newRecord(input.groupId, member.qq, verdict.reason, input.now)),
+      reason: verdict.reason, graceUntil: null, activeSince: null, marked,
+    })
+    if (marks && marked && canEditCard(input.botRole, member)) marks.push(unmarkChange(member, prefix, false))
+  }
+}
+
 /** 给不合格的人加标记（按 markCards）。row.marked 等 QQ 确认改成功后才由 applyPlan 改成 true。 */
 function planMark(input: PlanInput, plan: Plan, member: Member, row: TrackedMember, staff: boolean, marks: CardChange[]) {
   const prefix = input.settings.markPrefix
@@ -526,9 +558,10 @@ function planMark(input: PlanInput, plan: Plan, member: Member, row: TrackedMemb
  * 冷静中（cards 不为空）名片照常改：不合格的加标记，不用再管的撤标记，合格的按 AA 同步（DECISIONS 第 64 条）。
  */
 function planRecordOnly(input: PlanInput, plan: Plan, denied: Array<{ member: Member; verdict: Verdict }>,
-  cards: { settled: Member[]; syncs: CardChange[] } | null) {
+  held: Array<{ member: Member; verdict: Verdict }>, cards: { settled: Member[]; syncs: CardChange[] } | null) {
   const marks: CardChange[] = []
   if (cards) planSettled(input, plan, cards.settled, cards.syncs, marks)
+  planHeld(input, plan, held, cards ? marks : null)
   for (const { member, verdict } of denied) {
     const existing = input.tracked.get(member.qq)
     const row = existing ? { ...existing, reason: verdict.reason } : newRecord(input.groupId, member.qq, verdict.reason, input.now)
@@ -566,7 +599,7 @@ export function planRelease(
 export function emptyPlan(): Plan {
   return {
     counts: { members: 0, allow: 0, deny: 0, review: 0, unknown: 0 },
-    denies: [], protectedDenies: [], reviews: [], unknowns: [], newDenies: [], firstActions: [],
+    denies: [], protectedDenies: [], heldDenies: [], reviews: [], unknowns: [], newDenies: [], firstActions: [],
     threshold: 1, kicksDue: 0, breaker: 'none', breakerReason: '', breakerSet: [], breakerAdded: 0, regraced: 0,
     unknownHeavy: false, noRole: false, writes: false, cardWrites: false, track: [], untrack: [], cards: [], kicks: [],
     kicksDeferred: 0, cardsPending: 0, adminCardsBlocked: [], fastRemind: [],

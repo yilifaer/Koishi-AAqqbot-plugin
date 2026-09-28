@@ -1285,7 +1285,7 @@ describe('第二轮问题清单（回归测试）', () => {
     expect(call.params).toMatchObject({ group_id: +GROUP, no_cache: true })
   })
 
-  it('名单突然变少：不当作完整名单交给 AA，也不取消跟踪；下一轮名单稳定后恢复', async () => {
+  it('名单被截断（比 QQ 显示的群人数少）：不当作完整名单交给 AA，也不取消跟踪；真的退群（QQ 显示的人数也变少）马上恢复', async () => {
     env = await setup()
     const people = Array.from({ length: 20 }, (_, i) => String(40001 + i))
     addMembers(...people)
@@ -1293,14 +1293,16 @@ describe('第二轮问题清单（回归测试）', () => {
     await enableMode('remind')
     await env.guard.runPatrol([GROUP]) // 40001 被跟踪
     expect((await env.guard.store.tracked(GROUP)).has('40001')).toBe(true)
-    // LLBot 只返回了一部分人（40001 不在里面）
+    // LLBot 只返回了一部分人（40001 不在里面），QQ 显示的群人数还是 23
+    env.qq.memberCounts.set(GROUP, 23)
     const group = env.qq.groups.get(GROUP)!
     for (const qq of people.slice(0, 12)) group.delete(qq)
     await env.guard.runPatrol()
     expect(env.aa.last('check')!.body.full_roster).toBe(false)
     expect((await env.guard.store.tracked(GROUP)).has('40001')).toBe(true)
-    expect((await env.adminMessages()).at(-1)).toContain('可能不完整')
-    // 下一轮人数一样：按完整名单处理
+    expect((await env.adminMessages()).at(-1)).toContain('⚠ 名单可能不完整（名单 11 人，QQ 显示群里有 23 人）')
+    // 这些人真的退群了：QQ 显示的人数也变成 11
+    env.qq.memberCounts.delete(GROUP)
     await env.guard.runPatrol()
     expect(env.aa.last('check')!.body.full_roster).toBe(true)
     expect((await env.guard.store.tracked(GROUP)).has('40001')).toBe(false)
@@ -1512,9 +1514,10 @@ describe('群主、管理员的名片（K1）', () => {
     env.qq.failCard.add(ADMIN)
     await enableMode('remind')
     expect(await last()).toContain('· 管理员(10002) → [IGC] 管理员')
-    // LLBot 只返回了一部分人（管理员不在里面）
+    // LLBot 只返回了一部分人（管理员不在里面），QQ 显示的人数不变
     const group = env.qq.groups.get(GROUP)!
     const saved = new Map(group)
+    env.qq.memberCounts.set(GROUP, saved.size)
     for (const qq of [...people.slice(0, 12), ADMIN]) group.delete(qq)
     await env.guard.runPatrol()
     expect(await last()).toContain('可能不完整')
@@ -2441,29 +2444,151 @@ describe('消息分段（K13）', () => {
   })
 })
 
-describe('名单骤减检测不只挡一轮（K12）', () => {
-  it('可疑之后下一轮人数又不一样：仍然可疑，「上一轮人数」不变；连续两轮一样才恢复', async () => {
+describe('名单完整性：每轮用 QQ 显示的群人数核对（0.2.5，Issue #2）', () => {
+  const people = Array.from({ length: 20 }, (_, i) => String(40001 + i))
+  const full = () => env.aa.last('check')!.body.full_roster
+  const last = async () => (await env.adminMessages()).at(-1)!
+
+  /** 20 个合格成员 + 群主、管理员、机器人 = 23 人。 */
+  async function group23(mode: Mode = 'report') {
     env = await setup()
-    const people = Array.from({ length: 20 }, (_, i) => String(40001 + i))
     addMembers(...people)
     for (const qq of people) env.aa.allow(qq, `名片${qq}`)
+    setMode(mode)
+  }
+
+  it('第一次巡检名单就少 1 人：不算完整；连续几轮都少，每轮都不算', async () => {
+    await group23()
+    env.qq.memberCounts.set(GROUP, 24)
+    for (let i = 0; i < 3; i++) {
+      await env.guard.runPatrol()
+      expect(full()).toBe(false)
+      expect(await last()).toContain('⚠ 名单可能不完整（名单 23 人，QQ 显示群里有 24 人）')
+    }
+  })
+
+  it('名单比 QQ 显示的多 2 人还算完整，多 3 人不算', async () => {
+    await group23()
+    env.qq.memberCounts.set(GROUP, 21)
     await env.guard.runPatrol()
-    expect((await env.guard.store.groupState(GROUP)).lastRosterSize).toBe(23)
-    const group = env.qq.groups.get(GROUP)!
-    for (const qq of people.slice(0, 12)) group.delete(qq)
-    await env.guard.runPatrol() // 11 人：可疑
-    expect(env.aa.last('check')!.body.full_roster).toBe(false)
-    for (const qq of people.slice(12, 15)) group.delete(qq)
-    await env.guard.runPatrol() // 8 人：和上一轮不一样，仍然可疑
-    expect(env.aa.last('check')!.body.full_roster).toBe(false)
-    const state = await env.guard.store.groupState(GROUP)
-    expect(state.lastRosterSize).toBe(23)
-    expect(state.rosterCandidate).toBe(8)
-    await env.adminMessages()
-    await env.guard.runPatrol() // 还是 8 人：当作真的退群
-    expect(env.aa.last('check')!.body.full_roster).toBe(true)
-    expect((await env.guard.store.groupState(GROUP)).lastRosterSize).toBe(8)
-    expect((await env.adminMessages()).at(-1)).toContain('ℹ 连续两轮名单都是 8 人（上次完整名单 23 人），按真的退群处理')
+    expect(full()).toBe(true)
+    env.qq.memberCounts.set(GROUP, 20)
+    await env.guard.runPatrol()
+    expect(full()).toBe(false)
+  })
+
+  it('取不到 QQ 显示的群人数：隔一会儿再试一次；两次都不行这一轮不算完整', async () => {
+    await group23()
+    const original = env.qq.handle.bind(env.qq)
+    let failures = 1
+    env.qq.handle = (action, params) => {
+      if (action === 'get_group_info' && failures-- > 0) return { status: 'ok', retcode: 0, data: { group_id: 0, member_count: 0 } } // 错误帧
+      return original(action, params)
+    }
+    await env.guard.runPatrol()
+    expect(full()).toBe(true)
+    failures = 2
+    await env.guard.runPatrol()
+    expect(full()).toBe(false)
+    expect(await last()).toContain('⚠ 名单可能不完整（取不到 QQ 显示的群人数）')
+  })
+
+  it('取名单的时候有人进群或退群：这一轮不算完整', async () => {
+    await group23()
+    const platform = env.guard.platform as any
+    const original = platform.memberCount.bind(platform)
+    platform.memberCount = async (...args: any[]) => {
+      ;(env.guard as any).memberEvents.set(GROUP, 99)
+      return original(...args)
+    }
+    await env.guard.runPatrol()
+    expect(full()).toBe(false)
+    expect(await last()).toContain('取名单的时候有人进群或退群')
+  })
+
+  it('名单里有重复的 QQ：去重后交给 AA，报告里写明', async () => {
+    await group23()
+    const original = env.qq.handle.bind(env.qq)
+    env.qq.handle = (action, params) => {
+      const result = original(action, params)
+      if (action === 'get_group_member_list') result.data = [...result.data, result.data[5]]
+      return result
+    }
+    await env.guard.runPatrol()
+    expect(full()).toBe(true)
+    const body = env.aa.last('check')!.body
+    expect(new Set(body.qqs).size).toBe(body.qqs.length)
+    expect(await last()).toContain('ℹ 名单里有 1 条重复')
+  })
+
+  it('这个群从来没成功交过完整名单：「待验证」的人只报告，不加标记、不提醒、不移出；「没绑定」照常；核对通过后恢复', async () => {
+    await group23('enforce')
+    env.qq.memberCounts.set(GROUP, 30)
+    env.aa.deny('40001', 'PENDING_VERIFY')
+    env.aa.deny('40002', 'NOT_BOUND')
+    await env.guard.runPatrol()
+    await env.guard.runReminders()
+    expect(env.qq.member(GROUP, '40001')!.card).toBe('名片40001')
+    expect(env.qq.member(GROUP, '40002')!.card).toBe('【SPY】名片40002')
+    const ats = env.qq.groupMessages(GROUP).flatMap((m) => m.ats)
+    expect(ats).toContain('40002')
+    expect(ats).not.toContain('40001')
+    expect(await last()).toContain('待验证、先只报告 1 人')
+    // 名单核对通过：「待验证」也照常处置
+    env.qq.memberCounts.delete(GROUP)
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, '40001')!.card).toBe('【SPY】名片40001')
+  })
+
+  it('名单连续 72 小时没能核对：每轮巡检一条报警；aaqq.status 里显示几小时没能核对', async () => {
+    await group23()
+    env.qq.memberCounts.set(GROUP, 30)
+    await env.guard.runPatrol()
+    env.clock.now += 71 * HOUR
+    await env.guard.runPatrol()
+    expect((await env.adminMessages()).join('\n')).not.toContain('小时以上没能核对通过')
+    env.clock.now += HOUR
+    await env.guard.runPatrol()
+    const messages = await env.adminMessages()
+    expect(messages.join('\n').match(/小时以上没能核对通过/g)).toHaveLength(1)
+    expect(messages.join('\n')).toContain('联盟聊天群（111111111）（72 小时）')
+    expect(await env.guard.statusText()).toContain('名单 72 小时没能核对')
+  })
+
+  it('aaqq.roster：名单和手机上看到的人数对得上就放行一次；下一轮照常核对', async () => {
+    await group23()
+    env.qq.memberCounts.set(GROUP, 30)
+    await env.guard.runPatrol()
+    expect(full()).toBe(false)
+    expect(env.guard.setRosterOverride(GROUP, 23)).toContain('23～25 人')
+    await env.guard.runPatrol()
+    expect(full()).toBe(true)
+    expect(await last()).toContain('按 aaqq.roster 放行（手机 QQ 上 23 人，名单 23 人）')
+    await env.guard.runPatrol()
+    expect(full()).toBe(false)
+  })
+
+  it('aaqq.roster 的人数对不上（名单比它少）：不放行', async () => {
+    await group23()
+    env.qq.memberCounts.set(GROUP, 30)
+    env.guard.setRosterOverride(GROUP, 24)
+    await env.guard.runPatrol()
+    expect(full()).toBe(false)
+  })
+
+  it('以前的跟踪记录作废：机器人离线时退群、又回来的人，按新人处理，不沿用过期的截止时间', async () => {
+    env = await setup()
+    await enableMode('enforce')
+    const now = env.clock.now
+    await env.guard.store.saveTracked([{
+      groupId: GROUP, qq: '50001', reason: 'NOT_BOUND', firstDeniedAt: new Date(now - 30 * 24 * HOUR), marked: true,
+      activeSince: new Date(now - 30 * 24 * HOUR), lastRemindedAt: new Date(now - 26 * 24 * HOUR), graceUntil: new Date(now - 20 * 24 * HOUR),
+    }])
+    env.qq.groups.get(GROUP)!.set('50001', plainMember('50001', '回来了'))
+    await env.guard.handleNewMember(env.bot as any, GROUP, '50001')
+    const row = (await env.guard.store.tracked(GROUP)).get('50001')!
+    expect(row.firstDeniedAt.getTime()).toBe(now)
+    expect(row.graceUntil!.getTime()).toBe(now + 48 * HOUR) // 新人提醒重新给完整的宽限期
   })
 })
 
@@ -3076,7 +3201,7 @@ describe('离开联盟的人：马上提醒，2 小时后移出（0.2.3 F1）', 
     await env.guard.handleNewMember(env.bot as any, GROUP, '50001')
     expect(env.qq.groupMessages(GROUP)).toEqual([])
     const messages = (await env.adminMessages()).join('\n')
-    expect(messages).toContain('这个群在冷静期，只记录')
+    expect(messages).toContain('这个群在冷静期，不提醒（名片照常加标记）')
     expect(messages).not.toContain('已马上提醒')
     expect((await tracked('50001'))!.graceUntil).toBeNull()
   })

@@ -54,20 +54,41 @@ export class Platform {
    * adapter-onebot 的 getGroupMemberList 会丢掉 no_cache 参数（交接文档 03 #15），所以直接调用底层接口。
    */
   async listMembers(bot: Bot, groupId: string): Promise<Member[]> {
-    const id = Number(groupId)
-    const response = await (bot.internal as any)._request('get_group_member_list', {
-      group_id: Math.abs(id) < 4294967296 ? id : groupId,
-      no_cache: true,
-    })
+    return (await this.listMembersChecked(bot, groupId)).members
+  }
+
+  /** 取群成员名单，同时数出没有 QQ 号的条目和重复的 QQ（名单完整性核对用，DECISIONS 第 65 条）。members 已去重。 */
+  async listMembersChecked(bot: Bot, groupId: string): Promise<{ members: Member[]; invalid: number; duplicates: number }> {
+    const response = await (bot.internal as any)._request('get_group_member_list', { group_id: groupParam(groupId), no_cache: true })
     if (!response || response.retcode !== 0) throw new Error(`取群成员名单失败（retcode ${response?.retcode}）`)
     const list = response.data
     if (!Array.isArray(list)) throw new Error('群成员列表格式不对')
-    const members: Member[] = []
+    const members = new Map<string, Member>()
+    let invalid = 0
+    let duplicates = 0
     for (const item of list) {
       const member = toMember(item)
-      if (member) members.push(member)
+      if (!member) invalid++
+      else if (members.has(member.qq)) duplicates++
+      else members.set(member.qq, member)
     }
-    return members
+    return { members: [...members.values()], invalid, duplicates }
+  }
+
+  /**
+   * QQ 服务器给出的群人数（get_group_info，no_cache）。取不到（出错、群号对不上、人数不是正数）时返回 null。
+   * LLBot 收到错误帧时会解码成群号 0、人数 0，也落在「取不到」里。
+   */
+  async memberCount(bot: Bot, groupId: string): Promise<number | null> {
+    try {
+      const response = await (bot.internal as any)._request('get_group_info', { group_id: groupParam(groupId), no_cache: true })
+      if (!response || response.retcode !== 0) return null
+      if (normalizeId(response.data?.group_id) !== groupId) return null
+      const count = Number(response.data?.member_count)
+      return Number.isInteger(count) && count > 0 ? count : null
+    } catch {
+      return null
+    }
   }
 
   /** 实时查询一个成员（不走缓存）。查不到或出错时返回 null。 */
@@ -148,6 +169,12 @@ export class Platform {
     }
     return result
   }
+}
+
+/** 群号参数：能用数字就用数字（OneBot 的习惯）。 */
+function groupParam(groupId: string): number | string {
+  const id = Number(groupId)
+  return Math.abs(id) < 4294967296 ? id : groupId
 }
 
 function toMember(item: any): Member | null {

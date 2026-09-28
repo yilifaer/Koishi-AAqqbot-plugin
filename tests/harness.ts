@@ -222,6 +222,8 @@ export class FakeQQ {
   failSend = false
   /** 只让发往这些群的消息失败。 */
   failSendGroups = new Set<string>()
+  /** get_group_info 返回的群人数（没设就是名单人数；null 表示取不到）。 */
+  memberCounts = new Map<string, number | null>()
   /** 模拟 QQ 内容审核：返回 true 的消息被拒收（retcode 1200）。target 是群号或私聊对象的 QQ。 */
   refuseSend: ((text: string, target: string) => boolean) | null = null
   systemMsg: any = { join_requests: [], invited_requests: [] }
@@ -255,6 +257,12 @@ export class FakeQQ {
       case 'get_group_member_list':
         if (!group) return fail(100)
         return ok([...group.values()].map((m) => ({ group_id: params.group_id, ...m })))
+      case 'get_group_info': {
+        if (!group) return fail(100)
+        const count = this.memberCounts.has(String(params.group_id)) ? this.memberCounts.get(String(params.group_id)) : group.size
+        if (count === null) return fail(1200)
+        return ok({ group_id: params.group_id, group_name: '群', member_count: count, max_member_count: 500 })
+      }
       case 'get_group_member_info': {
         const m = group?.get(String(params.user_id))
         return m ? ok({ group_id: params.group_id, ...m }) : fail(100)
@@ -407,7 +415,7 @@ export async function setup(configPatch: Partial<Config> = {}, options: { start?
     name: 'aaqqbot-test',
     inject: ['database', 'http'],
     apply(ctx: Context) {
-      guard = new Guard(ctx, config, { timers: false, retryDelays: [], cardDelayMs: 0, kickDelayMs: 0, groupDelayMs: 0, sendGapMs: 0, now: () => clock.now })
+      guard = new Guard(ctx, config, { timers: false, retryDelays: [], cardDelayMs: 0, kickDelayMs: 0, groupDelayMs: 0, sendGapMs: 0, rosterRetryMs: 0, now: () => clock.now })
       guard.install()
       registerCommands(ctx, guard)
     },

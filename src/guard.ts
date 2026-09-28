@@ -41,6 +41,8 @@ export interface GuardOptions {
   patrolSoftBudgetMs?: number
   /** 机器人发的任意两条消息之间的间隔（默认 2 秒，DECISIONS 第 63 条）。 */
   sendGapMs?: number
+  /** 取不到 QQ 显示的群人数时，隔多久再试一次（默认 2 秒）。 */
+  rosterRetryMs?: number
 }
 
 export interface ModeInfo {
@@ -88,10 +90,13 @@ const PATROL_SOFT_BUDGET_MS = 20 * 60_000
 /** 一轮巡检的硬上限：超过就中止（防止卡死）。 */
 const PATROL_BUDGET_MS = 40 * 60_000
 /** 名单比上一轮少了这么多，就怀疑名单不完整。 */
-const ROSTER_DROP_MIN = 5
-const ROSTER_DROP_RATIO = 0.1
+/** 名单核对（DECISIONS 第 65 条）：上次成功交完整名单超过这么久，「待验证」的人只报告（AA 默认 7 天过期）。 */
+const ROSTER_FRESH_MS = 6 * 24 * 3600_000
+/** 名单连续这么久没能核对通过：运维群报警（每轮一条）。 */
+const ROSTER_ALARM_MS = 72 * 3600_000
+/** aaqq.roster 记下的人数多久内有效。 */
+const ROSTER_OVERRIDE_MS = 24 * 3600_000
 /** 可疑的名单下一轮人数差不多（±2）时，当作真的退群。 */
-const ROSTER_REPEAT_TOLERANCE = 2
 const FLAG_TTL_MS = 30 * 60_000
 const APPROVED_TTL_MS = 10 * 60_000
 const AUDIT_KEEP_MS = 180 * 86400_000
@@ -150,6 +155,10 @@ export class Guard {
   private fastBusy = false
   /** 因为暂停或 AA 故障没处理成的入群申请（群:QQ）：AA 恢复、解除暂停时只补处理这些（DECISIONS 第 56 条）。 */
   private retryJoin = new Set<string>()
+  /** 每个群收到过的进群、退群事件数：取名单期间有变化，这一轮的名单不算完整（DECISIONS 第 65 条）。 */
+  private memberEvents = new Map<string, number>()
+  /** aaqq.roster 记下的「手机 QQ 上看到的群人数」：下一次巡检用它核对一次。 */
+  private rosterOverrides = new Map<string, { count: number; at: number }>()
   private aaDown = false
   private botProblem: string | null = null
   private handledFlags = new Map<string, number>()
@@ -203,6 +212,63 @@ export class Guard {
 
   get groupsKey(): string {
     return `groups:${this.aaIdentity()}`
+  }
+
+  /** 每个群「上一次成功交完整名单」「从什么时候开始核对不过」，按 AA 分开存（DECISIONS 第 65 条）。 */
+  get rosterKey(): string {
+    return `roster:${this.aaIdentity()}`
+  }
+
+  private async rosterStates(): Promise<Record<string, { okAt?: number; failSince?: number }>> {
+    return (await this.store.getKv<Record<string, { okAt?: number; failSince?: number }>>(this.rosterKey)) ?? {}
+  }
+
+  /** 这一轮的名单核对结果：交了完整名单就记下时间，没交成就记下从什么时候开始核对不过。 */
+  private async noteRoster(groupId: string, full: boolean, complete: boolean, now: number) {
+    const states = await this.rosterStates()
+    const state = states[groupId] ?? {}
+    if (full) states[groupId] = { okAt: now }
+    else if (!complete) states[groupId] = { ...state, failSince: state.failSince ?? now }
+    else return
+    await this.store.setKv(this.rosterKey, states)
+  }
+
+  /** 这个群的名单还没核对通过（从来没成功交过完整名单，或者上次成功超过 6 天）：「待验证」的人只报告。 */
+  private async holdReasons(groupId: string): Promise<Set<string>> {
+    const okAt = (await this.rosterStates())[groupId]?.okAt
+    return okAt !== undefined && this.now() - okAt <= ROSTER_FRESH_MS ? new Set() : new Set(['PENDING_VERIFY'])
+  }
+
+  /** aaqq.roster：记下手机 QQ 上看到的群人数，下一次巡检名单是这个人数（最多多 2 人）就放行一次。 */
+  setRosterOverride(groupId: string, count: number): string {
+    const label = this.groupLabel(groupId)
+    this.rosterOverrides.set(groupId, { count, at: this.now() })
+    this.requestPatrol([groupId])
+    return `已记下：${label} 手机 QQ 上显示 ${count} 人。马上巡检一次，名单是 ${count}～${count + 2} 人就当作完整名单交给 AA（只放行这一次，24 小时内有效）。`
+  }
+
+  /**
+   * 核对这一轮的名单是否完整：和 QQ 服务器给出的群人数比，名单（去重后 + 没有 QQ 号的条数）要在 [人数, 人数+2] 之间。
+   * 取名单期间有人进群或退群，这一轮不算完整。
+   */
+  private async checkRoster(bot: Bot, groupId: string, listed: { members: Member[]; invalid: number; duplicates: number },
+    eventsBefore: number, signal: AbortSignal): Promise<{ complete: boolean; note: string }> {
+    let expected = await this.platform.memberCount(bot, groupId)
+    if (expected === null) {
+      await this.pause(this.options.rosterRetryMs ?? 2000, signal)
+      expected = await this.platform.memberCount(bot, groupId)
+    }
+    const override = this.rosterOverrides.get(groupId)
+    this.rosterOverrides.delete(groupId)
+    const n = listed.members.length + listed.invalid
+    const odd = [listed.duplicates ? `名单里有 ${listed.duplicates} 条重复` : '', listed.invalid ? `${listed.invalid} 条没有 QQ 号` : '']
+      .filter(Boolean).join('、')
+    if ((this.memberEvents.get(groupId) ?? 0) !== eventsBefore) return { complete: false, note: '取名单的时候有人进群或退群' }
+    if (expected !== null && n >= expected && n <= expected + 2) return { complete: true, note: odd }
+    if (override && this.now() - override.at <= ROSTER_OVERRIDE_MS && n >= override.count && n <= override.count + 2) {
+      return { complete: true, note: `按 aaqq.roster 放行（手机 QQ 上 ${override.count} 人，名单 ${n} 人）${odd ? `；${odd}` : ''}` }
+    }
+    return { complete: false, note: expected === null ? '取不到 QQ 显示的群人数' : `名单 ${n} 人，QQ 显示群里有 ${expected} 人` }
   }
 
   private aaIdentity(): string {
@@ -589,6 +655,7 @@ export class Guard {
       const text = sections.length ? `${header}\n\n${sections.join('\n\n')}` : `${header}\n没有需要巡检的群（都是 off 或 AA 上没有受管群）`
       this.lastRound = { at: started, ok, text }
       this.notifier.push(text)
+      await this.rosterAlarm(targets.map((x) => x.groupId))
       for (const after of afters) {
         try {
           await after()
@@ -644,9 +711,10 @@ export class Guard {
     const writesMode = mode === 'remind' || mode === 'enforce'
     const stateCoolingLine = () => (writesMode && state.holdSince ? [this.coolingLine(state.holdNote, state.holdSince.getTime())] : [])
 
-    let members: Member[]
+    const eventsBefore = this.memberEvents.get(g.groupId) ?? 0
+    let listed: { members: Member[]; invalid: number; duplicates: number }
     try {
-      members = await this.platform.listMembers(bot, g.groupId)
+      listed = await this.platform.listMembersChecked(bot, g.groupId)
     } catch (error) {
       await this.store.setGroupState(g.groupId, { lastPatrolOk: false, lastPatrolNote: '取群成员失败' })
       const why = isOneBotTimeout(error)
@@ -655,6 +723,7 @@ export class Guard {
       return { ok: false, text: [...head, ...stateCoolingLine(), why].join('\n') }
     }
     throwIfAborted(signal)
+    const members = listed.members
     this.rosters.set(g.groupId, new Map(members.map((m) => [m.qq, m])))
     const botRole = members.find((m) => m.qq === bot.selfId)?.role ?? null
     if (!botRole) {
@@ -662,14 +731,11 @@ export class Guard {
       return { ok: false, text: [...head, ...stateCoolingLine(), '❌ 机器人不在这个群里'].join('\n') }
     }
 
-    // 名单比上一轮明显变少：可能是 LLBot 刚启动、只返回了一部分人。
-    // 这一轮不当作完整名单交给 AA（否则 AA 会删掉不在名单里的老成员），也不据此取消任何人的跟踪。
-    // 「上一轮人数」不更新；下一轮人数还是差不多（±2）才当作真的退群（DECISIONS 第 42 条）。
-    const previous = state.lastRosterSize
+    // 名单可能不完整（LLBot 翻页时遇到错误会把已经拿到的几页当成功返回）：每一轮都用 QQ 显示的群人数核对。
+    // 不完整的这一轮不当作完整名单交给 AA（否则 AA 会删掉不在名单里的老成员），也不据此取消任何人的跟踪（DECISIONS 第 65 条）。
+    const roster = await this.checkRoster(bot, g.groupId, listed, eventsBefore, signal)
+    const suspicious = !roster.complete
     const size = members.length
-    const dropped = previous > 0 && previous - size > Math.max(ROSTER_DROP_MIN, Math.ceil(previous * ROSTER_DROP_RATIO))
-    const repeated = dropped && state.rosterCandidate > 0 && Math.abs(size - state.rosterCandidate) <= ROSTER_REPEAT_TOLERANCE
-    const suspicious = dropped && !repeated
     const qqs = members.map((m) => m.qq)
     const verdicts = new Map<string, Verdict>()
     const fullRoster = qqs.length <= MAX_CHECK && !suspicious
@@ -690,6 +756,7 @@ export class Guard {
 
     await this.migrated
     const now = this.now()
+    await this.noteRoster(g.groupId, fullRoster, roster.complete, now)
     // 0.1.x 里改了配置、还没 aaqq.confirm 的升级：旧记录重新算「第一次处置」，照样先冷静（DECISIONS 第 50 条）
     if (!state.lastMode && state.lastPatrolAt && isMode(state.confirmedMode) && writesMode
       && MODE_RANK[state.confirmedMode] < MODE_RANK[mode]) {
@@ -706,6 +773,7 @@ export class Guard {
       releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
       recentUnapprovedKicks: recentKicks.filter((row) => row.detail.includes(UNAPPROVED_KICK)).length,
       partial: suspicious,
+      holdReasons: await this.holdReasons(g.groupId),
       groupSize: members.length,
       members,
       verdicts,
@@ -726,9 +794,8 @@ export class Guard {
       lastPatrolAt: new Date(now),
       lastPatrolOk: true,
       lastPatrolNote: `成员 ${plan.counts.members}，不合格 ${plan.counts.deny}`,
-      // 这一轮自己踢掉的人不算「名单变少」（DECISIONS 第 57 条）
-      lastRosterSize: suspicious ? previous : Math.max(0, size - applied.kicked.length),
-      rosterCandidate: suspicious ? size : 0,
+      lastRosterSize: Math.max(0, size - applied.kicked.length),
+      rosterCandidate: 0,
       lastMode: mode,
     })
 
@@ -737,13 +804,27 @@ export class Guard {
     else if (plan.breaker === 'trip' || plan.breaker === 'restart') head.push(this.coolingLine(plan.breakerReason, now))
     const warnings: string[] = []
     if (suspicious) {
-      warnings.push(`⚠ 这次取到的名单比上一轮少了 ${previous - size} 人（${previous} → ${size}），可能不完整：本轮不作为完整名单交给 AA，也不取消任何人的跟踪。如果确实有很多人退群，下一轮人数一样时会自动恢复`)
-    } else if (repeated) {
-      warnings.push(`ℹ 连续两轮名单都是 ${size} 人（上次完整名单 ${previous} 人），按真的退群处理`)
+      warnings.push(`⚠ 名单可能不完整（${roster.note}）：本轮不作为完整名单交给 AA，也不取消任何人的跟踪，下一轮再核对`)
+    } else if (roster.note) {
+      warnings.push(`ℹ ${roster.note}`)
     }
     if (!fullRoster && !suspicious) warnings.push(`⚠ 群人数超过 ${MAX_CHECK}，名单分批提交，AA 上「老成员免验证」对这个群不生效`)
     const text = this.renderSection(head, plan, applied, members, mode, report.lines, warnings)
     return { ok: true, text, after: () => this.commitAdminCards(g.groupId, report) }
+  }
+
+  /** 名单连续 72 小时没能核对通过的群：每轮巡检后合并成一条报警（DECISIONS 第 65 条）。 */
+  private async rosterAlarm(groupIds: string[]) {
+    const states = await this.rosterStates()
+    const now = this.now()
+    const stale = groupIds.filter((id) => this.desiredMode(id) !== 'off' && states[id]?.failSince !== undefined
+      && now - states[id].failSince! >= ROSTER_ALARM_MS)
+    if (!stale.length) return
+    this.notifier.push([
+      `⚠ 这些群的名单已经连续 ${Math.floor(ROSTER_ALARM_MS / 3600_000)} 小时以上没能核对通过：${stale.map((id) => `${this.groupLabel(id)}（${Math.floor((now - states[id].failSince!) / 3600_000)} 小时）`).join('、')}`,
+      '后果：这期间交不了完整名单，AA 上「老成员免验证」会慢慢过期，「待验证」的人只报告、不处置；名单里漏掉的人也不会被取消跟踪。',
+      '临时办法：先把这个群改回 report；或者用手机 QQ 看一眼群人数，发 aaqq.roster 群号 人数 放行一次。',
+    ].join('\n'))
   }
 
   /** 冷静中的报告头一行。 */
@@ -883,6 +964,9 @@ export class Guard {
     if (plan.reviews.length) result.push(listSection(`需人工处理 ${plan.reviews.length} 人（在 AA「待处理」里处理）`, byReason(plan.reviews)))
     if (plan.protectedDenies.length) {
       result.push(listSection(`不合格但受保护 ${plan.protectedDenies.length} 人（群主/管理员/白名单，不处置）`, byReason(plan.protectedDenies)))
+    }
+    if (plan.heldDenies.length) {
+      result.push(listSection(`待验证、先只报告 ${plan.heldDenies.length} 人（这个群的名单还没核对通过，可能是被漏掉的老成员，不加标记、不提醒、不移出）`, byReason(plan.heldDenies)))
     }
     if (adminLines.length) result.push(adminLines.join('\n'))
     if (plan.unknowns.length) result.push(listSection(`无法判断 ${plan.unknowns.length} 人`, plan.unknowns.map((qq) => ({ text: who(qq) }))))
@@ -1286,6 +1370,7 @@ export class Guard {
     if (!bot || session.selfId !== bot.selfId) return
     const groupId = normalizeId(session.guildId)
     const qq = normalizeId(session.userId)
+    if (groupId) this.memberEvents.set(groupId, (this.memberEvents.get(groupId) ?? 0) + 1)
     if (!groupId || !qq || qq === bot.selfId) return
     await this.handleNewMember(bot, groupId, qq)
   }
@@ -1307,6 +1392,8 @@ export class Guard {
       member = await this.platform.getMember(bot, groupId, qq)
     }
     if (!member) return
+    // 他以前的跟踪记录（例如机器人离线时退群、没收到退群事件）作废：重新按新人处理，不沿用过期的截止时间
+    if ((await this.store.tracked(groupId)).has(qq)) await this.store.removeTracked(groupId, [qq])
     const roster = this.rosters.get(groupId)
     roster?.set(qq, member)
     const self = await this.platform.getMember(bot, groupId, bot.selfId)
@@ -1349,6 +1436,7 @@ export class Guard {
       cooling: this.coolingOf(state),
       releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
       partial: true,
+      holdReasons: await this.holdReasons(groupId),
       groupSize: groupSize || 1,
       members: [member],
       verdicts: result.verdicts,
@@ -1381,8 +1469,8 @@ export class Guard {
     const action = notReminded ? `${fast ? '已不具备成员资格，' : ''}提醒没有发出去（没有定截止时间，不会因此被移出）`
       : fast ? '已不具备成员资格，已马上提醒'
       : plan.writes ? '已开始宽限并提醒'
-      : plan.breaker === 'trip' ? '这个群进入冷静期，只记录'
-        : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，只记录'
+      : plan.breaker === 'trip' ? '这个群进入冷静期，不提醒（名片照常加标记）'
+        : info.cooling && (info.effective === 'remind' || info.effective === 'enforce') ? '这个群在冷静期，不提醒（名片照常加标记）'
         : plan.noRole ? '机器人不是群主或管理员，只记录'
           : `群模式 ${info.effective}，只报告`
     this.notifier.push(`👋 ${label} 新成员 ${name}：${verdict.decision === 'deny' ? `不合格（${reasonShort(verdict.reason)}），${action}` : verdict.decision === 'review' ? `需人工处理（${reasonShort(verdict.reason)}）` : 'AA 无法判断'}。`)
@@ -1392,6 +1480,7 @@ export class Guard {
     if (session.platform !== 'onebot') return
     const groupId = normalizeId(session.guildId)
     const qq = normalizeId(session.userId)
+    if (groupId) this.memberEvents.set(groupId, (this.memberEvents.get(groupId) ?? 0) + 1)
     if (!groupId || !qq || !this.group(groupId)) return
     this.rosters.get(groupId)?.delete(qq)
     await this.store.removeTracked(groupId, [qq])
@@ -1504,6 +1593,7 @@ export class Guard {
         cooling: this.coolingOf(state),
         releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
         partial: true,
+        holdReasons: await this.holdReasons(g.groupId),
         groupSize: roster.size,
         members,
         verdicts,
@@ -1579,6 +1669,7 @@ export class Guard {
           cooling: null, // 冷静中的群在上面 writeMode 已经跳过
           releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
           partial: true,
+          holdReasons: await this.holdReasons(g.groupId),
           groupSize: members.length,
           members: targets.map((qq) => roster.get(qq)!),
           verdicts: result.verdicts,
@@ -1806,6 +1897,7 @@ export class Guard {
           releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
           recentUnapprovedKicks: recentKicks.filter((row) => row.detail.includes(UNAPPROVED_KICK)).length,
           partial: true,
+          holdReasons: await this.holdReasons(g.groupId),
           groupSize: members.length,
           members: targets,
           verdicts: result.verdicts,
@@ -1888,12 +1980,15 @@ export class Guard {
       lines.push('受管群：AA 上还没有配置受管群')
     } else {
       lines.push('受管群：')
+      const rosters = await this.rosterStates()
       for (const g of this.groups) {
         const state = await this.store.groupState(g.groupId)
         const mode = this.desiredMode(g.groupId)
         const tracked = await this.store.tracked(g.groupId)
         const extra: string[] = []
         if (state.holdSince) extra.push(`冷静中，约 ${formatShortTime(state.holdSince.getTime() + this.cooldownMs())} 之后的巡检决定`)
+        const failSince = rosters[g.groupId]?.failSince
+        if (failSince !== undefined) extra.push(`名单 ${Math.floor((this.now() - failSince) / 3600_000)} 小时没能核对`)
         if (tracked.size) {
           const active = [...tracked.values()].filter((r) => r.activeSince).length
           extra.push(`已记录不合格 ${tracked.size} 人（其中已处置 ${active} 人）`)

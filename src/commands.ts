@@ -83,6 +83,7 @@ export function registerCommands(ctx: Context, guard: Guard) {
     'aaqq.patrol [群号]　立即巡检（不填群号就巡检全部）',
     'aaqq.confirm <群号>　提前结束冷静等待（可选，平时不用）',
     'aaqq.check <QQ号>　查询某个 QQ 的判定',
+    'aaqq.roster <群号> <人数>　名单一直核对不过时，按手机 QQ 上看到的群人数放行一次',
     'aaqq.pause　紧急暂停（停止一切审批、提醒、改名片、移出）',
     'aaqq.resume　恢复',
   ].join('\n')))
@@ -111,6 +112,16 @@ export function registerCommands(ctx: Context, guard: Guard) {
     const groupId = normalizeId(group)
     if (!groupId) return reply(session, '用法：aaqq.confirm 群号（只在群处于冷静期时有用，提前结束等待，马上巡检）')
     return reply(session, await guard.confirm(groupId, session?.userId ?? ''))
+  })
+
+  define('aaqq.roster <group:string> <count:string>', '按手机 QQ 上看到的群人数放行一次名单').action(async ({ session }, group, count) => {
+    const groupId = normalizeId(group)
+    const n = Number(count)
+    if (!groupId || !Number.isInteger(n) || n <= 0) {
+      return reply(session, '用法：aaqq.roster 群号 人数（人数是手机 QQ 上这个群显示的人数，要真的去看，不要照抄巡检报告里的数字）')
+    }
+    if (!guard.group(groupId)) return reply(session, `${group} 不是 AA 上的受管群。`)
+    return reply(session, guard.setRosterOverride(groupId, n))
   })
 
   define('aaqq.check <qq:string>', '查询某个 QQ 的判定').action(async ({ session }, qq) => {
