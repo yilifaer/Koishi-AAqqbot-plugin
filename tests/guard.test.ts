@@ -1940,6 +1940,75 @@ describe('机器人自己一轮移出很多人（0.2.3 R5）', () => {
   })
 })
 
+describe('特定群的提醒不 @ 人（0.2.6）', () => {
+  const tracked = async (qq: string) => (await env.guard.store.tracked(GROUP)).get(qq)
+
+  /** 这个群勾上「提醒不 @ 人」。 */
+  function noAt(mode: Mode) {
+    env.config.groupModes = [{ groupId: GROUP, mode, noAt: true }]
+  }
+
+  it('每日提醒：照常发、不 @，名单写成名字；照样算提醒过，到截止时间照常移出', async () => {
+    env = await setup()
+    addMembers('40001')
+    noAt('enforce')
+    await env.guard.runPatrol()
+    await env.guard.runReminders()
+    const message = env.qq.groupMessages(GROUP).at(-1)!
+    expect(message.ats).toEqual([])
+    expect(message.text).toContain('名片40001（没有在 AA 绑定 QQ，截止 ')
+    expect((await tracked('40001'))!.graceUntil).not.toBeNull()
+    await passDeadline()
+    expect(env.qq.groupMessages(GROUP).every((m) => m.ats.length === 0)).toBe(true)
+    await env.guard.runPatrol()
+    expect(env.qq.member(GROUP, '40001')).toBeUndefined()
+  })
+
+  it('新人、离开联盟、群主/管理员的提醒也都不 @', async () => {
+    env = await setup({ breakerCount: 100, breakerPercent: 100 })
+    addMembers('40001')
+    env.aa.allow('40001', '[IGC] 甲')
+    env.aa.deny(ADMIN)
+    noAt('enforce')
+    await env.guard.runPatrol()
+    await env.guard.runReminders() // 管理员单独的提醒
+    await env.guard.store.setKv(env.guard.cursorKey, 0)
+    env.aa.deny('40001', 'NO_ACCESS')
+    env.aa.events.push({ id: 1, kind: 'recheck', qq: '40001' }) // 离开联盟：马上提醒
+    await env.guard.pollEvents()
+    env.qq.groups.get(GROUP)!.set('50001', plainMember('50001', '新人'))
+    await env.guard.handleNewMember(env.bot as any, GROUP, '50001') // 新人提醒
+    const messages = env.qq.groupMessages(GROUP)
+    expect(messages.length).toBeGreaterThanOrEqual(3)
+    expect(messages.flatMap((m) => m.ats)).toEqual([])
+    const all = messages.map((m) => m.text).join('\n')
+    expect(all).toContain('管理员（')
+    expect(all).toContain('[IGC] 甲（')
+    expect(all).toContain('新人（')
+  })
+
+  it('名字按纯文本发：名片里写了 <at type="all"/> 也不会变成真的 @全体成员', async () => {
+    env = await setup()
+    env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', '<at type="all"/>'))
+    noAt('remind')
+    await env.guard.runPatrol()
+    await env.guard.runReminders()
+    const message = env.qq.groupMessages(GROUP).at(-1)!
+    expect(message.ats).toEqual([])
+    expect(JSON.stringify(message.raw)).not.toContain('"type":"at"')
+    expect(message.text).toContain('<at type="all"/>')
+  })
+
+  it('没勾的群照常 @', async () => {
+    env = await setup()
+    addMembers('40001')
+    env.config.groupModes = [{ groupId: GROUP, mode: 'remind', noAt: false }]
+    await env.guard.runPatrol()
+    await env.guard.runReminders()
+    expect(env.qq.groupMessages(GROUP).at(-1)!.ats).toEqual(['40001'])
+  })
+})
+
 describe('每日提醒留痕（K10）', () => {
   it('提醒后：操作记录、运维群回执', async () => {
     env = await setup()

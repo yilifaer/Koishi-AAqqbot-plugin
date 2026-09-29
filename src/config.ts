@@ -5,6 +5,8 @@ export type Mode = 'off' | 'report' | 'remind' | 'enforce'
 export interface GroupModeEntry {
   groupId: string
   mode: Mode
+  /** 这个群的提醒不 @ 人，名单写成名字（DECISIONS 第 67 条）。 */
+  noAt?: boolean
 }
 
 export interface Config {
@@ -91,8 +93,9 @@ export const Config: Schema<Config> = Schema.intersect([
     groupModes: Schema.array(Schema.object({
       groupId: Schema.string().required().description('群号'),
       mode: modeSchema.default('report').description('模式'),
+      noAt: Schema.boolean().default(false).description('提醒不 @ 人'),
     })).role('table').default([])
-      .description('单独设置某些群的模式。改了以后下一轮巡检（保存配置后约 20 秒）就生效；一下子要开始处置的人太多时会先进入冷静期（见「防误踢」）。降级立即生效。'),
+      .description('单独设置某些群的模式。改了以后下一轮巡检（保存配置后约 20 秒）就生效；一下子要开始处置的人太多时会先进入冷静期（见「防误踢」）。降级立即生效。勾上「提醒不 @ 人」的群，所有提醒照常发、照样算提醒过（enforce 照常移出），只是名单写成名字、不 @。'),
   }).description('群模式'),
 
   Schema.object({
