@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Verdict } from '../src/aa'
 import type { Mode } from '../src/config'
-import { breakerThreshold, markedCard, Member, PlanInput, planGroup, planRelease } from '../src/policy'
+import { breakerThreshold, effectiveGrace, markedCard, Member, PlanInput, planGroup, planRelease } from '../src/policy'
 import type { TrackedMember } from '../src/store'
 
 const NOW = Date.parse('2026-09-25T12:00:00+08:00')
@@ -882,5 +882,126 @@ describe('不合格的群主、管理员也加标记（0.2.2，markAdmins）', (
     const plan = planGroup(data)
     expect(plan.protectedDenies.map((d) => d.qq)).toEqual(['40001'])
     expect(plan.cards).toEqual([{ qq: '40001', from: '【SPY】张三', to: '张三', why: 'unmark', untrackAfter: true, admin: true }])
+  })
+})
+
+describe('不在本群提醒：借别的群的截止时间（0.2.7，DECISIONS 第 68 条）', () => {
+  const FROM = '222222222'
+  const lent = (graceUntil: number, lastRemindedAt: number) => ({ graceUntil: new Date(graceUntil), lastRemindedAt: new Date(lastRemindedAt), from: FROM })
+  const follow = (extra: Partial<NonNullable<PlanInput['follow']>> = {}): NonNullable<PlanInput['follow']> =>
+    ({ borrowed: new Map(), hold: new Set(), silent: new Set(), ...extra })
+  /** n 个截止时间已到、10 小时前提醒过的人。 */
+  function dueInput(n: number) {
+    const people: Array<[Member, Verdict]> = []
+    const rows = new Map<string, TrackedMember>()
+    for (let i = 0; i < n; i++) {
+      const qq = String(40001 + i)
+      people.push([member(qq), verdict(qq, 'deny')])
+      rows.set(qq, tracked(qq, { graceUntil: new Date(NOW - 1) }))
+    }
+    const data = input('enforce', people)
+    data.tracked = rows
+    return data
+  }
+
+  it('effectiveGrace：借来的提醒时间更晚（或本群没有）才用借来的，否则用本群的', () => {
+    const own = tracked('40001', { graceUntil: new Date(NOW + HOUR), lastRemindedAt: new Date(NOW - 10 * HOUR) })
+    const later = { graceUntil: new Date(NOW + 2 * HOUR), lastRemindedAt: new Date(NOW - HOUR) }
+    expect(effectiveGrace(own)).toEqual({ graceUntil: own.graceUntil, lastRemindedAt: own.lastRemindedAt, borrowed: false })
+    expect(effectiveGrace(undefined)).toEqual({ graceUntil: null, lastRemindedAt: null, borrowed: false })
+    // 借来的更晚
+    expect(effectiveGrace(own, later)).toEqual({ ...later, borrowed: true })
+    // 本群没有提醒时间（或没有记录）
+    expect(effectiveGrace(tracked('40001', { lastRemindedAt: null }), later)).toEqual({ ...later, borrowed: true })
+    expect(effectiveGrace(undefined, later)).toEqual({ ...later, borrowed: true })
+    // 借来的更早或一样：用本群的
+    expect(effectiveGrace(own, { graceUntil: new Date(NOW - HOUR), lastRemindedAt: new Date(NOW - 20 * HOUR) }).borrowed).toBe(false)
+    expect(effectiveGrace(own, { graceUntil: new Date(NOW - HOUR), lastRemindedAt: own.lastRemindedAt! }).borrowed).toBe(false)
+  })
+
+  it('借来的值让一个本群没提醒过的人可以被移出；记录写上借来的值，plan.borrowed 记下来源', () => {
+    const data = input('enforce', [[member('40001'), verdict('40001', 'deny')]])
+    data.tracked = new Map([['40001', tracked('40001', { graceUntil: null, lastRemindedAt: null })]])
+    expect(planGroup(data).kicks).toEqual([])
+    data.follow = follow({ borrowed: new Map([['40001', lent(NOW - 1, NOW - 10 * HOUR)]]) })
+    const plan = planGroup(data)
+    expect(plan.kicks.map((k) => k.qq)).toEqual(['40001'])
+    expect(plan.borrowed).toEqual([{ qq: '40001', from: FROM }])
+    expect(plan.track[0]).toMatchObject({ graceUntil: new Date(NOW - 1), lastRemindedAt: new Date(NOW - 10 * HOUR) })
+  })
+
+  it('借值不改变 isNew / newDenies / firstActions（熔断的「新开始处置」计数）', () => {
+    const data = input('enforce', [[member('40001'), verdict('40001', 'deny')], [member('40002'), verdict('40002', 'deny')]])
+    data.tracked = new Map([['40002', tracked('40002', { graceUntil: null, lastRemindedAt: null })]])
+    const without = planGroup(data)
+    data.follow = follow({ borrowed: new Map([['40001', lent(NOW + HOUR, NOW)], ['40002', lent(NOW + HOUR, NOW)]]) })
+    const plan = planGroup(data)
+    expect(plan.borrowed).toHaveLength(2)
+    expect(plan.denies).toEqual(without.denies)
+    expect(plan.newDenies).toEqual(without.newDenies)
+    expect(plan.firstActions).toEqual(without.firstActions)
+    expect(plan.breaker).toBe(without.breaker)
+  })
+
+  it('hold 里的人不能移出，计入「暂不移出」；「那边不移出」的人不计入', () => {
+    const data = dueInput(3)
+    data.follow = follow({ hold: new Set(['40001', '40002']), nokick: new Set(['40002']) })
+    const plan = planGroup(data)
+    expect(plan.kicks.map((k) => k.qq)).toEqual(['40003'])
+    expect(plan.followHeld).toBe(1)
+    // 截止时间还没到的也算「暂不移出」
+    const early = input('enforce', [[member('40001'), verdict('40001', 'deny')]])
+    early.tracked = new Map([['40001', tracked('40001')]])
+    early.follow = follow({ hold: new Set(['40001']) })
+    expect(planGroup(early).followHeld).toBe(1)
+  })
+
+  it('hold 里的人照样算进熔断的到期人数', () => {
+    const data = dueInput(6)
+    data.follow = follow({ hold: new Set(['40001', '40002', '40003', '40004', '40005', '40006']) })
+    const plan = planGroup(data)
+    expect(plan.breaker).toBe('trip')
+    expect(plan.breakerReason).toContain('一次有 6 人到期要移出')
+    expect(plan.kicks).toEqual([])
+    expect(plan.followHeld).toBe(0) // 本群自己不能处置时不说「暂不移出」
+  })
+
+  it('本群计时（silent）的人排在前面，再按每小时上限截断，其余顺序不变', () => {
+    const data = dueInput(4)
+    data.settings.kickBudget = 2
+    data.follow = follow({ silent: new Set(['40003']) })
+    const plan = planGroup(data)
+    expect(plan.kicks.map((k) => k.qq)).toEqual(['40003', '40001'])
+    expect(plan.kicksDeferred).toBe(2)
+  })
+
+  it('本群冷静中（只记录）也写借来的值；「待验证」暂缓的人不借；群主/管理员不借', () => {
+    const data = input('enforce', [
+      [member('40001'), verdict('40001', 'deny')],
+      [member('40002'), verdict('40002', 'deny', 'PENDING_VERIFY')],
+      [member('40003', { role: 'admin' }), verdict('40003', 'deny')],
+    ])
+    data.partial = true
+    data.cooling = { since: NOW - HOUR, set: new Set() }
+    data.holdReasons = new Set(['PENDING_VERIFY'])
+    data.settings.markAdmins = true
+    const borrowed = lent(NOW + HOUR, NOW - HOUR)
+    data.follow = follow({ borrowed: new Map([['40001', borrowed], ['40002', borrowed], ['40003', borrowed]]) })
+    const plan = planGroup(data)
+    expect(plan.breaker).toBe('cooling')
+    const rows = new Map(plan.track.map((r) => [r.qq, r]))
+    expect(rows.get('40001')).toMatchObject({ graceUntil: borrowed.graceUntil, lastRemindedAt: borrowed.lastRemindedAt })
+    expect(rows.get('40002')!.graceUntil).toBeNull()
+    expect(rows.get('40003')!.graceUntil).toBeNull()
+    expect(plan.borrowed).toEqual([{ qq: '40001', from: FROM }])
+  })
+
+  it('Plan.borrowed 只在真的改写时有记录：本群的提醒时间更新或一样时不记', () => {
+    const data = input('enforce', [[member('40001'), verdict('40001', 'deny')]])
+    data.tracked = new Map([['40001', tracked('40001', { graceUntil: new Date(NOW + HOUR), lastRemindedAt: new Date(NOW - HOUR) })]])
+    data.follow = follow({ borrowed: new Map([['40001', lent(NOW + 2 * HOUR, NOW - HOUR)]]) })
+    const plan = planGroup(data)
+    expect(plan.borrowed).toEqual([])
+    expect(plan.track[0].graceUntil).toEqual(new Date(NOW + HOUR))
   })
 })

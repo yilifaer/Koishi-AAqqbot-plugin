@@ -12,7 +12,7 @@ export interface TrackedMember {
   qq: string
   reason: string
   firstDeniedAt: Date
-  /** enforce 模式下的移出截止时间；第一次成功发出带截止时间的提醒时才定下。其他情况为 null。 */
+  /** enforce 模式下的移出截止时间；第一次成功发出带截止时间的提醒时才定下（勾了「不在本群提醒」的群可以借别的群的，或者不发消息直接计时，DECISIONS 第 68 条）。其他情况为 null。 */
   graceUntil: Date | null
   /** 名片上现在有没有机器人加的标记。 */
   marked: boolean
@@ -328,6 +328,13 @@ export class Store {
 
   async auditSince(action: string, groupId: string, since: Date): Promise<AuditRow[]> {
     return this.db.get('aaqqbot_audit', { action, groupId, at: { $gte: since } })
+  }
+
+  /** 某个人在某个群最近一条指定类型的操作记录（按 id 倒序取一条）；没有就返回 null。 */
+  async latestAudit(groupId: string, qq: string, actions: string[]): Promise<AuditRow | null> {
+    const rows = await this.db.select('aaqqbot_audit').where({ groupId, qq, action: { $in: actions } })
+      .orderBy('id', 'desc').limit(1).execute()
+    return rows[0] ?? null
   }
 
   async recentAudit(limit: number): Promise<AuditRow[]> {

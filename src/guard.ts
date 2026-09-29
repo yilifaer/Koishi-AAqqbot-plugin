@@ -15,7 +15,8 @@ import { classifySendError, describeSplit, HIDDEN_NAME, sendSplitting } from './
 import { Notifier } from './notifier'
 import { Platform } from './platform'
 import {
-  botCanWrite, canEditCard, Cooling, emptyPlan, isExempt, isProtected, Member, Plan, planGroup, planRelease, PlanSettings, Role,
+  botCanWrite, canEditCard, Cooling, effectiveGrace, emptyPlan, isExempt, isProtected, Member, Plan, planGroup, PlanInput, planRelease,
+  PlanSettings, Role,
 } from './policy'
 import { CardNote, extendModels, GroupState, isMode, Store, TrackedMember } from './store'
 import { MODE_TEXT, reasonShort, rejectHint } from './texts'
@@ -106,6 +107,11 @@ const AT_CHARS = 20
 const REJECT_REASON_MAX = 200
 /** 移出前这么久之内必须成功 @ 提醒过这个人。 */
 const REMIND_FRESH_MS = 36 * 3600_000
+/**
+ * 「和人有关」的原因：在每个群意思一样，勾了「不在本群提醒」的群可以跟着别的群走（DECISIONS 第 68 条）。
+ * GROUP_ROLE_MISSING 这类和群有关的原因不在里面：两个群的要求可能不一样。
+ */
+const PERSON_REASONS = new Set(['NOT_BOUND', 'PENDING_VERIFY', 'NO_MAIN', 'NO_ACCESS', 'USER_INACTIVE'])
 /** 每个群每轮最多改几张名片（刚上线时名片很多，分几轮改完，不占满巡检时间）。 */
 const MAX_CARDS_PER_ROUND = 100
 /** 报告里每个分类最多列几个人。 */
@@ -302,12 +308,123 @@ export class Guard {
     return (this.config.groupModes ?? []).some((entry) => normalizeId(entry.groupId) === groupId && !!entry.noAt)
   }
 
+  /** 这个群勾了「不在本群提醒」，并且是 remind / enforce 模式（report / off 下这个选项不起作用，DECISIONS 第 68 条）。 */
+  noRemind(groupId: string): boolean {
+    const mode = this.desiredMode(groupId)
+    return (mode === 'remind' || mode === 'enforce')
+      && (this.config.groupModes ?? []).some((entry) => normalizeId(entry.groupId) === groupId && !!entry.noRemind)
+  }
+
+  /** 报告、状态里模式后面的「（不在本群提醒）」。 */
+  private noRemindTag(groupId: string): string {
+    return this.noRemind(groupId) ? '（不在本群提醒）' : ''
+  }
+
+  /** 逐个群处理时的顺序：先处理没勾「不在本群提醒」的群，再处理勾了的群（各自保持原来的顺序）。 */
+  orderedGroups(): ManagedGroup[] {
+    return [...this.groups.filter((g) => !this.noRemind(g.groupId)), ...this.groups.filter((g) => this.noRemind(g.groupId))]
+  }
+
+  /**
+   * 勾了「不在本群提醒」的群 N 里，这些不合格的普通成员分别跟着哪个群走（DECISIONS 第 68 条）。
+   * 只读别的群的跟踪记录、群状态、名单缓存，不调 QQ 接口。
+   */
+  async followInfo(bot: Bot, groupId: string, items: Array<{ qq: string; reason: string }>): Promise<Map<string, FollowInfo>> {
+    const result = new Map<string, FollowInfo>()
+    if (!items.length) return result
+    const others: Array<{ groupId: string; mode: Mode; tracked: Map<string, TrackedMember>; cooling: boolean; hold: Set<string>; roster?: Map<string, Member> }> = []
+    for (const g of this.groups) {
+      const mode = this.desiredMode(g.groupId)
+      if (g.groupId === groupId || this.noRemind(g.groupId) || (mode !== 'remind' && mode !== 'enforce')) continue
+      others.push({
+        groupId: g.groupId,
+        mode,
+        tracked: await this.store.tracked(g.groupId),
+        cooling: (await this.store.groupState(g.groupId)).holdSince !== null,
+        hold: await this.holdReasons(g.groupId),
+        roster: this.rosters.get(g.groupId),
+      })
+    }
+    const now = this.now()
+    const protectedIds = this.protectedIds()
+    for (const { qq, reason } of items) {
+      let undecided = false
+      let cooling = false
+      const withDeadline: Array<{ groupId: string; record: TrackedMember }> = []
+      const reminders: string[] = []
+      for (const g of others) {
+        const record = g.tracked.get(qq)
+        if (!record || record.reason !== reason || !PERSON_REASONS.has(reason)) continue
+        // 候选群：已经开始处置；或者那个群在冷静期（冷静结束后会提醒他），并且他在那边不是暂缓的「待验证」
+        if (!record.activeSince && !(g.cooling && !g.hold.has(reason))) continue
+        const member = g.roster?.get(qq)
+        if (!member) {
+          undecided = true // 名单缓存没有他：可能是不完整的名单，他很可能还在那个群
+          continue
+        }
+        const self = g.roster!.get(bot.selfId)
+        if (!self) {
+          undecided = true // 名单缓存里连机器人自己都没有：名单不完整，判断不了机器人在那边能不能提醒
+          continue
+        }
+        if (!botCanWrite(self.role)) continue // 机器人在那边提醒不了人
+        reminders.push(g.groupId)
+        if (g.cooling) cooling = true
+        if (g.mode === 'enforce' && !isProtected(member, protectedIds)) withDeadline.push({ groupId: g.groupId, record })
+      }
+      if (undecided) {
+        result.set(qq, { status: 'undecided', borrowed: null, cooling: false, basis: null })
+      } else if (withDeadline.length) {
+        let borrowed: FollowInfo['borrowed'] = null
+        for (const { groupId: from, record } of withDeadline) {
+          const at = record.lastRemindedAt?.getTime()
+          if (!record.graceUntil || at === undefined || now - at > REMIND_FRESH_MS) continue
+          if (!borrowed || at > borrowed.lastRemindedAt.getTime()) borrowed = { graceUntil: record.graceUntil, lastRemindedAt: record.lastRemindedAt!, from }
+        }
+        result.set(qq, { status: 'follow', borrowed, cooling, basis: borrowed?.from ?? reminders[0] })
+      } else if (reminders.length) {
+        result.set(qq, { status: 'follow-nokick', borrowed: null, cooling, basis: reminders[0] })
+      } else {
+        result.set(qq, { status: 'silent', borrowed: null, cooling: false, basis: null })
+      }
+    }
+    return result
+  }
+
+  /** 勾了「不在本群提醒」的 enforce 群：算出这一轮不合格的普通成员跟着谁走，转成 planGroup 的 follow。其他群返回空。 */
+  private async followFor(bot: Bot, groupId: string, mode: Mode, members: Member[], verdicts: Map<string, Verdict>):
+    Promise<{ follow?: NonNullable<PlanInput['follow']>; infos: Map<string, FollowInfo> }> {
+    if (mode !== 'enforce' || !this.noRemind(groupId)) return { infos: new Map() }
+    const protectedIds = this.protectedIds()
+    const selfIds = this.platform.allSelfIds()
+    const items = members
+      .filter((m) => verdicts.get(m.qq)?.decision === 'deny' && !isProtected(m, protectedIds) && !selfIds.has(m.qq))
+      .map((m) => ({ qq: m.qq, reason: verdicts.get(m.qq)!.reason }))
+    const infos = await this.followInfo(bot, groupId, items)
+    return { follow: toFollow(infos), infos }
+  }
+
+  /** 真的暂停了：本实例暂停，或者数据库里记着暂停（插件重启后新旧实例共用）。读出错就当没暂停。 */
+  private async reallyPaused(): Promise<boolean> {
+    if (this.paused) return true
+    try {
+      return (await this.store.getKv<boolean>('paused')) === true
+    } catch {
+      return false
+    }
+  }
+
   modeInfo(groupId: string, state: GroupState): ModeInfo {
     return { effective: this.desiredMode(groupId), cooling: state.holdSince !== null }
   }
 
   private writeMode(info: ModeInfo) {
     return (info.effective === 'remind' || info.effective === 'enforce') && !info.cooling && !this.paused
+  }
+
+  /** 可以改名片：remind / enforce、没有暂停（冷静期里也照常改，DECISIONS 第 64 条）。 */
+  private cardMode(info: ModeInfo) {
+    return (info.effective === 'remind' || info.effective === 'enforce') && !this.paused
   }
 
   /** 「离开联盟」类原因（AA 的原因码）。 */
@@ -636,7 +753,7 @@ export class Guard {
       if (!this.groupsLoaded) await this.refreshGroups()
       if (!this.groupsLoaded) return 'no-groups'
       await this.migrated
-      const targets = this.groups.filter((g) => !only || only.includes(g.groupId))
+      const targets = this.orderedGroups().filter((g) => !only || only.includes(g.groupId))
       const sections: string[] = []
       const afters: Array<() => Promise<void>> = []
       let ok = true
@@ -707,7 +824,7 @@ export class Guard {
       return { ok: true, text: '' }
     }
 
-    const head = [`▶ ${label}　${MODE_TEXT[mode]}`]
+    const head = [`▶ ${label}　${MODE_TEXT[mode]}${this.noRemindTag(g.groupId)}`]
     // 上一个模式：0.1.x 的数据只有 confirmedMode（从来没巡检过的新群不提示）
     const previousMode = state.lastMode || (state.lastPatrolAt ? state.confirmedMode : '')
     if (previousMode && previousMode !== mode) {
@@ -779,6 +896,7 @@ export class Guard {
       recentUnapprovedKicks: recentKicks.filter((row) => row.detail.includes(UNAPPROVED_KICK)).length,
       partial: suspicious,
       holdReasons: await this.holdReasons(g.groupId),
+      follow: (await this.followFor(bot, g.groupId, mode, members, verdicts)).follow,
       groupSize: members.length,
       members,
       verdicts,
@@ -955,6 +1073,7 @@ export class Guard {
     if (plan.kicksDeferred) actions.push(`${plan.kicksDeferred} 人因每小时上限推迟到下一轮`)
     if (applied.kickFailed) actions.push(`移出失败 ${applied.kickFailed} 人`)
     if (applied.kickSkipped) actions.push(`复核后跳过 ${applied.kickSkipped} 人`)
+    if (plan.followHeld) actions.push(`${plan.followHeld} 人跟随的群在冷静期、还没提醒到或暂时判断不了，暂不移出`)
     if (actions.length) result.push(['本轮动作', ...actions.map((a) => `· ${a}`)].join('\n'))
 
     if (applied.kicked.length) {
@@ -1054,6 +1173,8 @@ export class Guard {
     }
     await this.store.removeTracked(groupId, plan.untrack)
     await this.store.saveTracked(plan.track)
+    // 不在本群提醒：用别的群的截止时间改写了本群的记录（DECISIONS 第 68 条）
+    for (const { qq, from } of plan.borrowed) await this.store.audit('follow', groupId, qq, from)
     const roster = this.rosters.get(groupId)
 
     if (plan.kicks.length) await this.applyKicks(bot, groupId, plan, signal, result)
@@ -1144,7 +1265,13 @@ export class Guard {
         const releasedBefore = (await this.store.groupState(groupId)).lastConfirmAt?.getTime() ?? 0
         const approved = deadline <= releasedBefore
         const fast = this.fastReasons().has(verdict.reason) ? `；${FAST_KICK}` : ''
-        await this.store.audit('kick', groupId, kick.qq, `${reasonShort(verdict.reason)}${fast}${approved ? '' : `；${UNAPPROVED_KICK}`}${note}`)
+        // 不在本群提醒：记下本群记录上的截止时间是从哪里来的（借别的群的，还是不发消息本群计时，DECISIONS 第 68 条）
+        let basis = ''
+        if (this.noRemind(groupId)) {
+          const last = await this.store.latestAudit(groupId, kick.qq, ['follow', 'remind'])
+          basis = last?.action === 'follow' ? `；follow:${last.detail}` : '；silent'
+        }
+        await this.store.audit('kick', groupId, kick.qq, `${reasonShort(verdict.reason)}${fast}${approved ? '' : `；${UNAPPROVED_KICK}`}${note}${basis}`)
       }
       try {
         await this.platform.kick(bot, groupId, kick.qq)
@@ -1161,14 +1288,19 @@ export class Guard {
       const base = this.options.kickDelayMs ?? 3000
       await this.pause(base + Math.random() * base, signal)
     }
-    if (result.kicked.length && this.config.kickAnnounce) await this.announceKicks(bot, groupId, result.kicked.map((k) => k.name), signal)
+    if (result.kicked.length && this.config.kickAnnounce) {
+      // 不在本群提醒的群不发移出公告（运维群照常有报告，DECISIONS 第 68 条）
+      if (this.noRemind(groupId)) this.logger.info('群 %s 设置了「不在本群提醒」，不发移出公告（%d 人）', groupId, result.kicked.length)
+      // 人已经移出了：插件重启、巡检超时也照样公告，只有真的暂停了才不发（DECISIONS 第 71 条）
+      else await this.announceKicks(bot, groupId, result.kicked.map((k) => k.name))
+    }
   }
 
   /**
    * 移出公告：每条最多 20 个名字、约 800 字；被 QQ 拒收时拆小重发，单独一个名字还被拒就隐藏这个名字（DECISIONS 第 62 条）。
    * 超时、其他失败不重发（超时的其实可能已经发出去了，K11）。
    */
-  private async announceKicks(bot: Bot, groupId: string, names: string[], signal: AbortSignal) {
+  private async announceKicks(bot: Bot, groupId: string, names: string[]) {
     const url = this.bindUrl()
     const render = (part: string[]) => fillTemplate(this.config.kickAnnounceTemplate, { list: part.join('、'), url })
     const batches: string[][] = []
@@ -1177,13 +1309,13 @@ export class Guard {
       if (last && last.length < REMIND_CHUNK && charLength(render([...last, name])) <= MAX_LIST_CHARS) last.push(name)
       else batches.push([name])
     }
-    for (const batch of batches) {
+    for (const [index, batch] of batches.entries()) {
       const report = await sendSplitting(batch, async (part) => {
         const text = render(part)
         try {
           // 长名字的公告可能超过 1500 字：照旧分段
           for (const piece of splitMessage(text)) {
-            if (!(await this.platform.sendGroup(bot, groupId, h.text(piece), () => !signal.aborted && !this.paused))) return 'skipped'
+            if (!(await this.platform.sendGroup(bot, groupId, h.text(piece), async () => !(await this.reallyPaused())))) return 'skipped'
           }
           return 'sent'
         } catch (error) {
@@ -1194,12 +1326,17 @@ export class Guard {
       }, {
         hide: () => HIDDEN_NAME,
         onLost: (part, _, why) => {
-          this.logger.warn('群 %s 的移出公告没有发出（%s），这些名字没公告：%s', groupId, why === 'skipped' ? '已经暂停' : why, part.join('、'))
+          const reason = why === 'skipped' ? '已经暂停' : why === 'refused' ? '被 QQ 拒收' : '发送失败'
+          this.logger.warn('群 %s 的移出公告没有发出（%s），这些名字没公告：%s', groupId, reason, part.join('、'))
         },
         onHidden: (name) => this.logger.warn('群 %s 的移出公告里「%s」被 QQ 拒收，已隐藏这个名字', groupId, name),
       })
       if (report.split) this.logger.warn('群 %s 的移出公告（%d 人）%s', groupId, batch.length, describeSplit(report))
-      if (!report.delivered) break
+      if (!report.delivered) {
+        const left = batches.slice(index + 1).flat()
+        if (left.length) this.logger.warn('群 %s 的移出公告停止发送，剩下这些名字也没公告：%s', groupId, left.join('、'))
+        break
+      }
     }
   }
 
@@ -1405,8 +1542,8 @@ export class Guard {
     const botRole = self?.role ?? null
 
     if (approved) {
-      // 刚由机器人同意的申请：AA 已经判过 allow，只需要设名片（新人一定是普通成员）
-      if (this.writeMode(info) && this.config.syncCards && approved.card && member.card !== approved.card
+      // 刚由机器人同意的申请：AA 已经判过 allow，只需要设名片（新人一定是普通成员）；冷静期里也照常改（DECISIONS 第 64 条）
+      if (this.cardMode(info) && this.config.syncCards && approved.card && member.card !== approved.card
         && canEditCard(botRole, member) && !isProtected(member, this.protectedIds())) {
         try {
           await this.platform.setCard(bot, groupId, qq, approved.card)
@@ -1435,6 +1572,7 @@ export class Guard {
       } catch {}
     }
     const now = this.now()
+    const followed = await this.followFor(bot, groupId, info.effective, [member], result.verdicts)
     const plan = planGroup({
       groupId,
       mode: info.effective,
@@ -1442,6 +1580,7 @@ export class Guard {
       releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
       partial: true,
       holdReasons: await this.holdReasons(groupId),
+      follow: followed.follow,
       groupSize: groupSize || 1,
       members: [member],
       verdicts: result.verdicts,
@@ -1471,7 +1610,9 @@ export class Guard {
     } else if (plan.writes && plan.newDenies.length) {
       notReminded = !(await this.sendReminder(bot, groupId, info.effective, plan.track.filter((t) => t.qq === qq), 'newcomer')).sent
     }
-    const action = notReminded ? `${fast ? '已不具备成员资格，' : ''}提醒没有发出去（没有定截止时间，不会因此被移出）`
+    const action = this.noRemind(groupId) && plan.writes && verdict.decision === 'deny'
+      ? `不在本群提醒：${await this.newcomerFollowText(groupId, member, info.effective, fast, followed.infos.get(qq))}`
+      : notReminded ? `${fast ? '已不具备成员资格，' : ''}提醒没有发出去（没有定截止时间，不会因此被移出）`
       : fast ? '已不具备成员资格，已马上提醒'
       : plan.writes ? '已开始宽限并提醒'
       : plan.breaker === 'trip' ? '这个群进入冷静期，不提醒（名片照常加标记）'
@@ -1479,6 +1620,23 @@ export class Guard {
         : plan.noRole ? '机器人不是群主或管理员，只记录'
           : `群模式 ${info.effective}，只报告`
     this.notifier.push(`👋 ${label} 新成员 ${name}：${verdict.decision === 'deny' ? `不合格（${reasonShort(verdict.reason)}），${action}` : verdict.decision === 'review' ? `需人工处理（${reasonShort(verdict.reason)}）` : 'AA 无法判断'}。`)
+  }
+
+  /** 新人进了勾「不在本群提醒」的群：运维群里说他跟着谁走（DECISIONS 第 68 条）。 */
+  private async newcomerFollowText(groupId: string, member: Member, mode: Mode, fast: boolean, info: FollowInfo | undefined): Promise<string> {
+    if (mode === 'remind') return '没有发群消息（remind 模式，不移出）'
+    if (isProtected(member, this.protectedIds())) return '没有发群消息（群主/管理员，不移出）'
+    const row = (await this.store.tracked(groupId)).get(member.qq)
+    const deadline = row?.graceUntil ? formatDeadline(row.graceUntil.getTime()) : null
+    if (info?.status === 'follow') {
+      const from = info.borrowed?.from ?? info.basis
+      return info.borrowed && deadline ? `跟随 ${this.groupLabel(from!)} 的截止时间 ${deadline}` : `跟随 ${this.groupLabel(from!)}，等那边提醒后再定截止时间`
+    }
+    if (info?.status === 'follow-nokick') return `跟随 ${this.groupLabel(info.basis!)}（那边不移出他，本群也不移出）`
+    if (info?.status === 'silent') {
+      return deadline ? `${fast ? '已不具备成员资格，' : ''}没有发群消息，${deadline} 移出` : '没有发群消息，轮到时已经暂停或不能再发，没有定截止时间'
+    }
+    return '暂时判断不了，下一轮再定'
   }
 
   private async onMemberRemoved(session: Session) {
@@ -1557,7 +1715,7 @@ export class Guard {
     await this.migrated
     const sections: string[] = []
     const afters: Array<() => Promise<void>> = []
-    for (const g of this.groups) {
+    for (const g of this.orderedGroups()) {
       let state = await this.store.groupState(g.groupId)
       const mode = this.desiredMode(g.groupId)
       if ((mode === 'report' || mode === 'off') && state.holdSince) state = await this.clearCooling(g.groupId, mode)
@@ -1599,6 +1757,7 @@ export class Guard {
         releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
         partial: true,
         holdReasons: await this.holdReasons(g.groupId),
+        follow: (await this.followFor(bot, g.groupId, mode, members, verdicts)).follow,
         groupSize: roster.size,
         members,
         verdicts,
@@ -1617,7 +1776,7 @@ export class Guard {
       const report = await this.adminCardReport(g.groupId, plan, applied, members, verdicts, notes, false)
       const changed = plan.newDenies.length || plan.untrack.length || applied.cardsOk || report.lines.length
       if (changed) {
-        const head = [`▶ ${this.groupLabel(g.groupId)}　${MODE_TEXT[mode]}`]
+        const head = [`▶ ${this.groupLabel(g.groupId)}　${MODE_TEXT[mode]}${this.noRemindTag(g.groupId)}`]
         if (plan.breaker === 'trip') head.push(this.coolingLine(plan.breakerReason, now))
         else if (plan.breaker === 'cooling' && state.holdSince) head.push(this.coolingLine(state.holdNote, state.holdSince.getTime()))
         sections.push(this.renderSection(head, plan, applied, members, mode, report.lines, []))
@@ -1644,7 +1803,7 @@ export class Guard {
       const bot = this.pickBot()
       if (!bot) return
       await this.migrated
-      for (const g of this.groups) {
+      for (const g of this.orderedGroups()) {
         if (this.signal.aborted || this.paused) return
         const state = await this.store.groupState(g.groupId)
         const info = this.modeInfo(g.groupId, state)
@@ -1668,6 +1827,7 @@ export class Guard {
           if (result.kind !== 'aborted') this.noteAaFailure(result, `提醒 ${this.groupLabel(g.groupId)}`)
           continue
         }
+        const remindMembers = targets.map((qq) => roster.get(qq)!)
         const plan = planGroup({
           groupId: g.groupId,
           mode: info.effective,
@@ -1675,8 +1835,9 @@ export class Guard {
           releasedBefore: state.lastConfirmAt?.getTime() ?? 0,
           partial: true,
           holdReasons: await this.holdReasons(g.groupId),
+          follow: (await this.followFor(bot, g.groupId, info.effective, remindMembers, result.verdicts)).follow,
           groupSize: members.length,
-          members: targets.map((qq) => roster.get(qq)!),
+          members: remindMembers,
           verdicts: result.verdicts,
           tracked,
           protectedIds: this.protectedIds(),
@@ -1694,12 +1855,25 @@ export class Guard {
         const rows = plan.track.filter((r) => r.activeSince && !fast.has(r.qq))
         await this.sendFastReminders(bot, g.groupId, info.effective, plan)
         const normal = await this.sendReminder(bot, g.groupId, info.effective, rows.filter((r) => !staff.has(r.qq)), 'daily')
-        const admins = await this.sendReminder(bot, g.groupId, info.effective, rows.filter((r) => staff.has(r.qq)), 'daily', true)
+        // QQ 拒收了这个群的提醒（拆到单独一个人也发不出去）：管理员的提醒也不发（DECISIONS 第 69 条）
+        const adminRows = rows.filter((r) => staff.has(r.qq))
+        const admins = normal.blocked
+          ? { sent: 0, failed: adminRows.length, timedOut: false }
+          : await this.sendReminder(bot, g.groupId, info.effective, adminRows, 'daily', true)
         const sent = { sent: normal.sent + admins.sent, failed: normal.failed + admins.failed, timedOut: normal.timedOut || admins.timedOut }
         const label = this.groupLabel(g.groupId)
         if (sent.sent) this.notifier.push(`⏰ ${label} 已提醒 ${sent.sent} 人`)
+        if (this.noRemind(g.groupId) && info.effective === 'enforce') {
+          // 不在本群提醒：一行汇总（DECISIONS 第 68 条）
+          const parts = [
+            normal.followed ? `跟随别的群 ${normal.followed} 人` : '',
+            normal.silent.length ? `没发消息、本群计时 ${normal.silent.length} 人` : '',
+            normal.undecided ? `暂时判断不了 ${normal.undecided} 人` : '',
+          ].filter(Boolean)
+          if (parts.length) this.notifier.push(`⏰ ${label}（不在本群提醒）：${parts.join('，')}`)
+        }
         if (sent.failed) {
-          this.notifier.push(`⚠ ${label} 提醒没有发出去（${sent.failed} 人），没有记提醒时间，这些人不会因此被移出${sent.timedOut ? '；LLBot 响应超时，群里可能其实已经看到了' : ''}`)
+          this.notifier.push(`⚠ ${label} 提醒没有发出去（${sent.failed} 人），没有记提醒时间，这些人不会因此被移出${sent.timedOut ? '；LLBot 响应超时，群里可能其实已经看到了' : ''}${normal.blocked ? '；QQ 拒收了这个群的提醒（拆到单独一个人也发不出去），剩下的没有再发' : ''}`)
         }
       }
       await this.scheduleFastKicks()
@@ -1710,12 +1884,14 @@ export class Guard {
 
   /**
    * 在群里 @ 提醒（每条最多 20 人、约 800 字，DECISIONS 第 62 条）。
-   * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（发出时间 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒。
+   * enforce 模式下，第一次成功提醒某人时才定下他的截止时间（发出时间 + 宽限期），保证每个人被移出前都收到过带截止时间的提醒；
+   * 勾了「不在本群提醒」的群可以借别的群的，或者不发消息直接计时（DECISIONS 第 68 条）。
    * 被 QQ 拒收就对半拆开重发；超时、其他失败不重发（超时的其实可能已经发出去了），也不记提醒时间：没收到提醒的人不会被移出。
+   * 一批拆到单独一个人也一条都没送达（QQ 可能拒收这个群的消息）：这个群剩下的不再发（DECISIONS 第 69 条）。
    */
   async sendReminder(bot: Bot, groupId: string, mode: Mode, rows: TrackedMember[], source: 'daily' | 'newcomer' | 'fast' = 'daily', staff = false):
-    Promise<{ sent: number; failed: number; timedOut: boolean; reminded: TrackedMember[] }> {
-    const outcome = { sent: 0, failed: 0, timedOut: false, reminded: [] as TrackedMember[] }
+    Promise<ReminderOutcome> {
+    const outcome: ReminderOutcome = { sent: 0, failed: 0, timedOut: false, blocked: false, reminded: [], followed: 0, silent: [], undecided: 0 }
     if (!rows.length) return outcome
     // 群主 / 管理员：单独的文字，没有截止时间（永远不移出）
     const withDeadline = mode === 'enforce' && !staff
@@ -1731,6 +1907,12 @@ export class Guard {
       }
       return row.graceUntil ?? new Date(now + this.config.graceHours * 3600_000)
     }
+    const what = source === 'daily' ? '每日提醒' : source === 'fast' ? '离开联盟提醒' : '新人提醒'
+    // 勾了「不在本群提醒」的群：一条消息都不发（DECISIONS 第 68 条）
+    if (this.noRemind(groupId)) {
+      if (mode === 'remind' || staff) return outcome
+      return this.remindSilently(bot, groupId, rows, deadlineFor, what, outcome)
+    }
     const url = this.bindUrl()
     const [beforeList, ...rest] = template.split('{list}')
     const head = fillTemplate(beforeList, { url })
@@ -1741,19 +1923,21 @@ export class Guard {
       const deadline = !graceUntil ? '' : graceUntil.getTime() <= now ? '，已过截止时间，下一次处理时会被移出' : `，截止 ${formatDeadline(graceUntil.getTime())}`
       return `（${reasonShort(row.reason)}${deadline}）\n`
     }
-    // 不 @ 人的群：名单写成名字（没有名字就写 QQ 号），照样算提醒过（DECISIONS 第 67 条）
+    // 不 @ 人的群：名单写成名字（没有名字就写 QQ 号），照样算提醒过（DECISIONS 第 67 条）；
+    // 单独一个名字被拒收时改写成 QQ 号再发一次（plainQq，DECISIONS 第 70 条）
     const noAt = this.noAt(groupId)
     const roster = this.rosters.get(groupId)
     const nameOf = (qq: string) => {
       const member = roster?.get(qq)
       return (member && displayName(member.card, member.nickname, this.config.markPrefix ?? '')) || qq
     }
-    const whoLength = (qq: string) => (noAt ? charLength(nameOf(qq)) : AT_CHARS)
-    const estimate = (part: TrackedMember[]) => charLength(head) + charLength(tail)
-      + part.reduce((sum, row) => sum + whoLength(row.qq) + charLength(entryText(row, this.now())), 0)
+    const whoText = (entry: RemindEntry) => (entry.plainQq ? entry.row.qq : nameOf(entry.row.qq))
+    const whoLength = (entry: RemindEntry) => (noAt ? charLength(whoText(entry)) : AT_CHARS)
+    const estimate = (part: RemindEntry[]) => charLength(head) + charLength(tail)
+      + part.reduce((sum, entry) => sum + whoLength(entry) + charLength(entryText(entry.row, this.now())), 0)
     // 每批最多 20 人；一条消息估算超过约 800 字就再对半拆（名单分短，DECISIONS 第 62 条）
-    const queue = chunk(rows, REMIND_CHUNK)
-    const batches: TrackedMember[][] = []
+    const queue = chunk(rows.map((row): RemindEntry => ({ row })), REMIND_CHUNK)
+    const batches: RemindEntry[][] = []
     while (queue.length) {
       const part = queue.shift()!
       if (part.length > 1 && estimate(part) > MAX_LIST_CHARS) {
@@ -1763,10 +1947,16 @@ export class Guard {
       }
       batches.push(part)
     }
-    const what = source === 'daily' ? '每日提醒' : source === 'fast' ? '离开联盟提醒' : '新人提醒'
     let stopped = false
-    for (const batch of batches) {
+    for (const [index, batch] of batches.entries()) {
       if (stopped) break
+      if (outcome.blocked) {
+        const left = batches.slice(index).flat()
+        outcome.failed += left.length
+        this.logger.warn('群 %s 的%s：上一批拆到单独一个人也一条都没送达（QQ 可能拒收这个群的消息），剩下 %d 人不再发，没提醒到：%s',
+          groupId, what, left.length, left.map((entry) => maskId(entry.row.qq)).join('、'))
+        break
+      }
       let delivered = 0
       let skipped = 0
       // 被 QQ 拒收就对半拆开重发，只剩 1 人还被拒就算没提醒到（他不会因此被移出）
@@ -1779,9 +1969,9 @@ export class Guard {
         let updated: TrackedMember[] = []
         const build = () => {
           const now = this.now()
-          updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
+          updated = part.map(({ row }) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
           const content: Fragment[] = [h.text(head)]
-          for (const row of updated) content.push(noAt ? h.text(nameOf(row.qq)) : h.at(row.qq), h.text(entryText(row, now)))
+          for (const [i, row] of updated.entries()) content.push(noAt ? h.text(whoText(part[i])) : h.at(row.qq), h.text(entryText(row, now)))
           if (tail) content.push(h.text(tail))
           return content as any
         }
@@ -1805,15 +1995,54 @@ export class Guard {
         await this.store.audit('remind', groupId, '', `${part.length} 人（${what}）`)
         return 'sent'
       }, {
+        hide: noAt ? (entry) => (entry.plainQq || nameOf(entry.row.qq) === entry.row.qq ? null : { ...entry, plainQq: true }) : undefined,
+        onHidden: (entry, _, result) => {
+          this.logger.warn('群 %s 的%s里「%s」被 QQ 拒收，改成只写 QQ 号重发：%s', groupId, what, nameOf(entry.row.qq),
+            result === 'sent' ? '已送达，算提醒过' : 'LLBot 响应超时，不算提醒过')
+        },
         onLost: (part, _, why) => {
-          const reason = why === 'refused' ? '被 QQ 拒收，单独 @ 也发不出去' : why === 'skipped' ? '轮到时已经暂停或不能再发' : '发送失败'
-          this.logger.warn('群 %s 的%s没有发出（%s），这些人没提醒到：%s', groupId, what, reason, part.map((row) => maskId(row.qq)).join('、'))
+          const reason = why === 'refused' ? (noAt ? '被 QQ 拒收，只写 QQ 号也发不出去' : '被 QQ 拒收，单独 @ 也发不出去')
+            : why === 'skipped' ? '轮到时已经暂停或不能再发' : '发送失败'
+          this.logger.warn('群 %s 的%s没有发出（%s），这些人没提醒到：%s', groupId, what, reason, part.map((entry) => maskId(entry.row.qq)).join('、'))
         },
       })
       outcome.sent += delivered
       outcome.failed += batch.length - delivered - skipped
-      if (report.split) this.logger.warn('群 %s 的%s（%d 人）%s', groupId, what, batch.length, describeSplit(report))
+      if (report.split) this.logger.warn('群 %s 的%s（%d 人）%s', groupId, what, batch.length, describeSplit(report, (n) => `其中 ${n} 人改写成 QQ 号重发`))
+      // 两个人以上的一批拆到底也一条都没送达：QQ 可能拒收这个群的消息，剩下的不再发（单独一个人被拒、超时的不算）
+      if (report.halved && !report.delivered && !report.timedOut && !report.skipped) outcome.blocked = true
     }
+    return outcome
+  }
+
+  /**
+   * 勾了「不在本群提醒」的 enforce 群（DECISIONS 第 68 条）：一条消息都不发。跟着别的群走的人什么都不做；
+   * 不发消息、本群计时的人，在本来要提醒的时刻记下提醒时间和截止时间（记之前做和真发送一样的复核）。
+   */
+  private async remindSilently(bot: Bot, groupId: string, rows: TrackedMember[], deadlineFor: (row: TrackedMember, now: number) => Date | null,
+    what: string, outcome: ReminderOutcome): Promise<ReminderOutcome> {
+    const infos = await this.followInfo(bot, groupId, rows.map((row) => ({ qq: row.qq, reason: row.reason })))
+    const silent: TrackedMember[] = []
+    for (const row of rows) {
+      const status = infos.get(row.qq)?.status
+      if (status === 'silent') silent.push(row)
+      else if (status === 'undecided') outcome.undecided++
+      else outcome.followed++
+    }
+    if (!silent.length) return outcome
+    if (!(await this.stillWritable(groupId, this.signal))) {
+      this.logger.warn('群 %s 的%s没有记（轮到时已经暂停或不能再发），这些人不算提醒过：%s', groupId, what, silent.map((row) => maskId(row.qq)).join('、'))
+      return outcome
+    }
+    const now = this.now()
+    const updated = silent.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
+    await this.store.markReminded(groupId, updated)
+    for (const row of silent) {
+      if (!row.graceUntil) await this.store.audit('remind', groupId, row.qq, `silent（${what}）`)
+    }
+    await this.store.audit('remind', groupId, '', `${updated.length} 人（${what}；silent）`)
+    this.logger.info('群 %s 不在本群提醒：%d 人没发消息、本群计时（%s）', groupId, updated.length, what)
+    outcome.silent = updated
     return outcome
   }
 
@@ -1830,12 +2059,16 @@ export class Guard {
       const when = mode === 'enforce' && row.graceUntil ? `，${formatDeadline(row.graceUntil.getTime())} 移出` : ''
       return `⚡ ${label} ${who} 已不具备成员资格（${reasonShort(row.reason)}），已提醒${when}`
     })
+    // 不在本群提醒、本群计时的人（跟着别的群走的人那边已经有 ⚡ 行，DECISIONS 第 68 条）
+    for (const row of result.silent) {
+      lines.push(`⚡ ${label} ${this.who(roster?.get(row.qq), row.qq)} 已不具备成员资格（${reasonShort(row.reason)}），没有发群消息（不在本群提醒），${formatDeadline(row.graceUntil!.getTime())} 移出`)
+    }
     if (lines.length) this.notifier.push(lines.join('\n'))
     if (result.failed) {
       this.notifier.push(`⚠ ${label} 离开联盟的提醒没有发出去（${result.failed} 人），没有定截止时间，下一次复查或巡检时再试${result.timedOut ? '；LLBot 响应超时，群里可能其实已经看到了' : ''}`)
     }
     await this.scheduleFastKicks()
-    return result.reminded.length
+    return result.reminded.length + result.silent.length
   }
 
   /** 按最早的一个「离开联盟」截止时间安排到期检查（插件启动、定下截止时间、解除暂停时调用）。 */
@@ -1877,12 +2110,21 @@ export class Guard {
     try {
       await this.migrated
       const reasons = this.fastReasons()
-      for (const g of this.groups) {
+      for (const g of this.orderedGroups()) {
         if (this.signal.aborted || this.paused) break
         if (this.desiredMode(g.groupId) !== 'enforce') continue
         const now = this.now()
         const tracked = await this.store.tracked(g.groupId)
-        const due = [...tracked.values()].filter((r) => r.graceUntil && r.graceUntil.getTime() <= now && reasons.has(r.reason))
+        // 不在本群提醒：先算出每个人跟着谁走，用借来的截止时间判断到期；暂不移出的人不算到期（DECISIONS 第 68 条）。
+        // 这里原因用记录上的，是不是普通成员由后面的 planGroup 判断
+        const follow = this.noRemind(g.groupId)
+          ? toFollow(await this.followInfo(bot, g.groupId, [...tracked.values()].filter((r) => reasons.has(r.reason)).map((r) => ({ qq: r.qq, reason: r.reason }))))
+          : undefined
+        const due = [...tracked.values()].filter((r) => {
+          if (!reasons.has(r.reason) || follow?.hold.has(r.qq)) return false
+          const deadline = effectiveGrace(r, follow?.borrowed.get(r.qq)).graceUntil
+          return deadline !== null && deadline.getTime() <= now
+        })
         if (!due.length) continue
         let members: Member[]
         try {
@@ -1911,6 +2153,7 @@ export class Guard {
           recentUnapprovedKicks: recentKicks.filter((row) => row.detail.includes(UNAPPROVED_KICK)).length,
           partial: true,
           holdReasons: await this.holdReasons(g.groupId),
+          follow,
           groupSize: members.length,
           members: targets,
           verdicts: result.verdicts,
@@ -1929,7 +2172,7 @@ export class Guard {
           await this.store.setGroupState(g.groupId, { lastRosterSize: Math.max(0, state.lastRosterSize - applied.kicked.length) })
         }
         if (applied.kicked.length || applied.kickSkipped || applied.kickFailed || plan.kicksDeferred || plan.breaker !== 'none') {
-          const head = [`▶ ${this.groupLabel(g.groupId)}　${MODE_TEXT.enforce}`]
+          const head = [`▶ ${this.groupLabel(g.groupId)}　${MODE_TEXT.enforce}${this.noRemindTag(g.groupId)}`]
           if (plan.breaker === 'trip') head.push(this.coolingLine(plan.breakerReason, now))
           else if (plan.breaker === 'cooling' && state.holdSince) head.push(this.coolingLine(state.holdNote, state.holdSince.getTime()))
           this.notifier.push(`【离开联盟到期处理】\n\n${this.renderSection(head, plan, applied, targets, 'enforce', [], [])}`)
@@ -2006,7 +2249,7 @@ export class Guard {
           const active = [...tracked.values()].filter((r) => r.activeSince).length
           extra.push(`已记录不合格 ${tracked.size} 人（其中已处置 ${active} 人）`)
         }
-        lines.push(`· ${this.groupLabel(g.groupId)}：${MODE_TEXT[mode]}${extra.length ? `（${extra.join('，')}）` : ''}`)
+        lines.push(`· ${this.groupLabel(g.groupId)}：${MODE_TEXT[mode]}${this.noRemindTag(g.groupId)}${extra.length ? `（${extra.join('，')}）` : ''}`)
       }
     }
     return lines.join('\n')
@@ -2045,6 +2288,58 @@ export class Guard {
     this.lastPrune = now
     await this.store.pruneAudit(new Date(now - AUDIT_KEEP_MS))
   }
+}
+
+/** sendReminder 的结果。silent 是不发消息、本群计时的人（勾了「不在本群提醒」的群），不在 reminded 里。 */
+export interface ReminderOutcome {
+  sent: number
+  failed: number
+  timedOut: boolean
+  /** 一批拆到单独一个人也一条都没送达，剩下的没有再发（DECISIONS 第 69 条）。 */
+  blocked: boolean
+  reminded: TrackedMember[]
+  /** 跟着别的群走的人数（跟随·有截止时间、跟随·不移出）。 */
+  followed: number
+  silent: TrackedMember[]
+  /** 暂时判断不了跟着谁走的人数。 */
+  undecided: number
+}
+
+/** 分批提醒的一项：plainQq 表示名字被拒收后改写成 QQ 号重发（DECISIONS 第 70 条）。 */
+interface RemindEntry {
+  row: TrackedMember
+  plainQq?: boolean
+}
+
+/** 勾了「不在本群提醒」的群里一个不合格的人跟着谁走（DECISIONS 第 68 条）。 */
+export interface FollowInfo {
+  /** follow 跟随·有截止时间；follow-nokick 跟随·不移出；silent 不发消息、本群计时；undecided 暂时判断不了 */
+  status: 'follow' | 'follow-nokick' | 'silent' | 'undecided'
+  /** 可以借的截止时间和提醒时间（那边 36 小时内成功提醒过）。 */
+  borrowed: { graceUntil: Date; lastRemindedAt: Date; from: string } | null
+  /** 任何一个提醒群在冷静期。 */
+  cooling: boolean
+  /** 有 borrowed 时是它的来源群；否则是第一个提醒群；silent / undecided 为 null。 */
+  basis: string | null
+}
+
+/** followInfo 的结果转成 planGroup 的 follow：借值、暂不移出、本群计时。 */
+function toFollow(infos: Map<string, FollowInfo>): NonNullable<PlanInput['follow']> {
+  const borrowed = new Map<string, { graceUntil: Date; lastRemindedAt: Date; from: string }>()
+  const hold = new Set<string>()
+  const nokick = new Set<string>()
+  const silent = new Set<string>()
+  for (const [qq, info] of infos) {
+    if (info.status === 'silent') {
+      silent.add(qq)
+      continue
+    }
+    if (info.status === 'follow' && info.borrowed) borrowed.set(qq, info.borrowed)
+    // 跟随的群在冷静期、还没提醒到、那边不移出、暂时判断不了：不移出
+    if (info.status !== 'follow' || !info.borrowed || info.cooling) hold.add(qq)
+    if (info.status === 'follow-nokick') nokick.add(qq)
+  }
+  return { borrowed, hold, nokick, silent }
 }
 
 /** 白名单里写得不对的条目：一条一行（名单分短、被拒时拆开都按行来，DECISIONS 第 62 条）。 */

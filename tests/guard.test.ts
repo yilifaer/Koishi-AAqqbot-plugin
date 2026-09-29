@@ -3,10 +3,10 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OneBot } from 'koishi-plugin-adapter-onebot'
-import type { Mode } from '../src/config'
-import { charLength } from '../src/util'
+import type { Config, GroupModeEntry, Mode } from '../src/config'
+import { charLength, formatDeadline } from '../src/util'
 import {
-  ADMIN, ADMIN_GROUP, BOT, Env, GROUP, OPERATOR, OTHER_GROUP, OWNER, plainMember, setup, sleep, waitFor,
+  ADMIN, ADMIN_GROUP, BOT, baseMembers, Env, GROUP, OPERATOR, OTHER_GROUP, OWNER, plainMember, setup, sleep, waitFor,
 } from './harness'
 
 let env: Env
@@ -3284,5 +3284,829 @@ describe('离开联盟的人：马上提醒，2 小时后移出（0.2.3 F1）', 
     await env.guard.setPaused(false, OPERATOR)
     await env.guard.runPatrol()
     expect(env.qq.member(GROUP, '40001')).toBeUndefined()
+  })
+})
+
+describe('不在本群提醒（0.2.7）', () => {
+  const G = GROUP
+  const N = OTHER_GROUP
+  const G_LABEL = '联盟聊天群（111111111）'
+  const N_LABEL = '通知群（222222222）'
+  const row = async (groupId: string, qq: string) => (await env.guard.store.tracked(groupId)).get(qq)
+  const audits = (action: string, groupId: string) => env.guard.store.auditSince(action, groupId, new Date(0))
+  const kicked = (groupId: string) => env.qq.actions('set_group_kick').filter((c) => String(c.params.group_id) === groupId).map((c) => String(c.params.user_id))
+
+  interface TwoGroups {
+    /** 两个群都有的人。 */
+    both?: string[]
+    onlyG?: string[]
+    onlyN?: string[]
+    /** 这些人一开始合格。 */
+    allowed?: string[]
+    g?: Partial<GroupModeEntry>
+    n?: Partial<GroupModeEntry>
+    config?: Partial<Config>
+    /** 巡检之前再改点什么。 */
+    prepare?: () => void
+  }
+
+  /**
+   * G、N 两个 enforce 群，N 勾「不在本群提醒」（也开着「提醒不 @ 人」）。order 是 AA 受管群列表里的顺序。
+   * 设好以后巡检一轮（加上标记、开始处置），清掉运维群消息。
+   */
+  async function twoGroups(order: 'GN' | 'NG', options: TwoGroups = {}) {
+    env = await setup({ breakerCount: 100, breakerPercent: 100, ...options.config })
+    env.qq.addGroup(N, baseMembers())
+    const entry = { group_id: N, name: '通知群', kind: 'fixed' }
+    if (order === 'GN') env.aa.groups.push(entry)
+    else env.aa.groups.unshift(entry)
+    await env.guard.refreshGroups()
+    env.config.groupModes = [{ groupId: G, mode: 'enforce', ...options.g }, { groupId: N, mode: 'enforce', noAt: true, noRemind: true, ...options.n }]
+    for (const qq of [...(options.both ?? []), ...(options.onlyG ?? [])]) env.qq.groups.get(G)!.set(qq, plainMember(qq, `名片${qq}`))
+    for (const qq of [...(options.both ?? []), ...(options.onlyN ?? [])]) env.qq.groups.get(N)!.set(qq, plainMember(qq, `名片${qq}`))
+    for (const qq of options.allowed ?? []) env.aa.allow(qq, `名片${qq}`)
+    options.prepare?.()
+    await env.guard.runPatrol()
+    await env.adminMessages()
+  }
+
+  /** 让 group 进入冷静期（冷静开始时那批人为空：满 6 小时就自动结束）。 */
+  async function cool(groupId: string) {
+    await env.guard.store.setGroupState(groupId, { holdSince: new Date(env.clock.now), holdNote: '测试', holdSet: '[]' })
+  }
+
+  for (const order of ['GN', 'NG'] as const) {
+    describe(`AA 列表顺序 ${order === 'GN' ? '[G, N]' : '[N, G]'}`, () => {
+      it('1. 两个群都有的人：只有 G 发提醒；N 借 G 的截止时间和提醒时间，写 follow 审计；运维群「跟随别的群 1 人」', async () => {
+        await twoGroups(order, { both: ['40001'] })
+        expect(env.guard.orderedGroups().map((g) => g.groupId)).toEqual([G, N])
+        expect(env.qq.member(N, '40001')!.card).toBe('【SPY】名片40001')
+        await env.guard.runReminders()
+        expect(env.qq.groupMessages(G)).toHaveLength(1)
+        expect(env.qq.groupMessages(N)).toEqual([])
+        const g = (await row(G, '40001'))!
+        const n = (await row(N, '40001'))!
+        expect(g.graceUntil).not.toBeNull()
+        expect(n.graceUntil!.getTime()).toBe(g.graceUntil!.getTime())
+        expect(n.lastRemindedAt!.getTime()).toBe(g.lastRemindedAt!.getTime())
+        expect((await audits('follow', N)).map((a) => [a.qq, a.detail])).toEqual([['40001', G]])
+        const messages = (await env.adminMessages()).join('\n')
+        expect(messages).toContain(`⏰ ${G_LABEL} 已提醒 1 人`)
+        expect(messages).toContain(`⏰ ${N_LABEL}（不在本群提醒）：跟随别的群 1 人`)
+        expect(messages).not.toContain(`⏰ ${N_LABEL} 已提醒`)
+      })
+
+      it('2. 到期后一次巡检：两个群都移出他；N 没有公告，运维报告照常列出；N 的 kick 审计以「；follow:<G>」结尾', async () => {
+        await twoGroups(order, { both: ['40001'] })
+        await env.guard.runReminders()
+        await passDeadline()
+        await env.adminMessages()
+        await env.guard.runPatrol()
+        expect(env.qq.member(G, '40001')).toBeUndefined()
+        expect(env.qq.member(N, '40001')).toBeUndefined()
+        expect(env.qq.groupMessages(G).at(-1)!.text).toContain('已被移出：名片40001')
+        expect(env.qq.groupMessages(N)).toEqual([])
+        const [kick] = await audits('kick', N)
+        expect(kick.detail.endsWith(`；follow:${G}`)).toBe(true)
+        const report = (await env.adminMessages()).join('\n')
+        const section = report.slice(report.indexOf(`▶ ${N_LABEL}`))
+        expect(section).toContain('enforce（提醒并移出）（不在本群提醒）')
+        expect(section).toContain('已移出 1 人')
+      })
+
+      it('3. G 先把他移出以后：N 的下一次巡检按借来的截止时间移出他，N 里没有任何消息', async () => {
+        await twoGroups(order, { both: ['40001'] })
+        await env.guard.runReminders()
+        await passDeadline()
+        await env.guard.runPatrol([G])
+        expect(env.qq.member(G, '40001')).toBeUndefined()
+        expect(env.qq.member(N, '40001')).toBeDefined()
+        await env.guard.runPatrol([N])
+        expect(env.qq.member(N, '40001')).toBeUndefined()
+        expect(env.qq.groupMessages(N)).toEqual([])
+        const [kick] = await audits('kick', N)
+        expect(kick.detail.endsWith(`；follow:${G}`)).toBe(true)
+      })
+
+      it('4. 只在 N 的人：不发消息、本群计时（截止 = 提醒时间 + 48 小时），审计带 silent；到期移出，kick 审计「；silent」', async () => {
+        await twoGroups(order, { onlyN: ['40002'] })
+        const t = env.clock.now
+        await env.guard.runReminders()
+        expect(env.qq.groupMessages(N)).toEqual([])
+        const n = (await row(N, '40002'))!
+        expect(n.lastRemindedAt!.getTime()).toBe(t)
+        expect(n.graceUntil!.getTime()).toBe(t + 48 * HOUR)
+        expect((await audits('remind', N)).map((a) => [a.qq, a.detail])).toEqual([['40002', 'silent（每日提醒）'], ['', '1 人（每日提醒；silent）']])
+        expect((await env.adminMessages()).join('\n')).toContain(`⏰ ${N_LABEL}（不在本群提醒）：没发消息、本群计时 1 人`)
+        await passDeadline()
+        expect((await row(N, '40002'))!.graceUntil!.getTime()).toBe(t + 48 * HOUR) // 截止时间不变，提醒时间照常刷新
+        expect((await audits('remind', N)).filter((a) => a.qq === '40002')).toHaveLength(1) // 只在第一次定下截止时间时写
+        await env.guard.runPatrol()
+        expect(env.qq.member(N, '40002')).toBeUndefined()
+        expect(env.qq.groupMessages(N)).toEqual([])
+        const [kick] = await audits('kick', N)
+        expect(kick.detail.endsWith('；silent')).toBe(true)
+      })
+
+      it('5. 离开联盟：只有 G 发 ⚡，N 借到同一个 +2 小时的截止时间；只在 N 的人不发 ⚡、本群计时；2 小时后两个群都移出', async () => {
+        await twoGroups(order, { both: ['40001'], onlyN: ['40002'], allowed: ['40001', '40002'] })
+        await env.guard.store.setKv(env.guard.cursorKey, 0)
+        env.aa.deny('40001', 'NO_ACCESS')
+        env.aa.deny('40002', 'NO_ACCESS')
+        env.aa.events.push({ id: 1, kind: 'recheck', qq: '40001' }, { id: 2, kind: 'recheck', qq: '40002' })
+        const t = env.clock.now
+        await env.guard.pollEvents()
+        expect(env.qq.groupMessages(G)).toHaveLength(1)
+        expect(env.qq.groupMessages(G)[0].ats).toEqual(['40001'])
+        expect(env.qq.groupMessages(N)).toEqual([])
+        expect((await row(G, '40001'))!.graceUntil!.getTime()).toBe(t + 2 * HOUR)
+        expect((await row(N, '40001'))!.graceUntil!.getTime()).toBe(t + 2 * HOUR)
+        expect((await row(N, '40002'))!.graceUntil!.getTime()).toBe(t + 2 * HOUR)
+        expect(env.qq.member(N, '40002')!.card).toBe('【SPY】名片40002')
+        const messages = (await env.adminMessages()).join('\n')
+        expect(messages).toContain(`⚡ ${G_LABEL} 名片40001(40001) 已不具备成员资格（AA 账号没有成员资格），已提醒，`)
+        expect(messages).not.toContain(`⚡ ${N_LABEL} 名片40001`)
+        expect(messages).toContain(`⚡ ${N_LABEL} 名片40002(40002) 已不具备成员资格（AA 账号没有成员资格），没有发群消息（不在本群提醒），${formatDeadline(t + 2 * HOUR)} 移出`)
+        expect(env.guard.nextFastKickAt).toBe(t + 2 * HOUR)
+        env.clock.now = t + 2 * HOUR + 60_000
+        await env.guard.runFastKicks()
+        expect(env.qq.member(G, '40001')).toBeUndefined()
+        expect(env.qq.member(N, '40001')).toBeUndefined()
+        expect(env.qq.member(N, '40002')).toBeUndefined()
+        expect(env.qq.groupMessages(N)).toEqual([])
+        const report = (await env.adminMessages()).join('\n')
+        expect(report).toContain(`▶ ${N_LABEL}　enforce（提醒并移出）（不在本群提醒）`)
+      })
+
+      it('6. 新人进 N：在 G 提醒过 → 借 G 的截止时间；只在 N → 进群 + 48 小时；G 的名单缓存还没有 → 暂时判断不了', async () => {
+        await twoGroups(order, { onlyG: ['40001', '40003'] })
+        await env.guard.runReminders()
+        const g = (await row(G, '40001'))!
+        env.clock.now += HOUR
+        env.qq.groups.get(N)!.set('40001', plainMember('40001', '名片40001'))
+        await env.guard.handleNewMember(env.bot as any, N, '40001')
+        env.qq.groups.get(N)!.set('50001', plainMember('50001', '新人'))
+        await env.guard.handleNewMember(env.bot as any, N, '50001')
+        expect(env.qq.groupMessages(N)).toEqual([])
+        expect(env.qq.member(N, '40001')!.card).toBe('【SPY】名片40001')
+        const n = (await row(N, '40001'))!
+        expect(n.graceUntil!.getTime()).toBe(g.graceUntil!.getTime())
+        expect(n.activeSince).not.toBeNull()
+        expect((await row(N, '50001'))!.graceUntil!.getTime()).toBe(env.clock.now + 48 * HOUR)
+        let messages = (await env.adminMessages()).join('\n')
+        expect(messages).toContain(`👋 ${N_LABEL} 新成员 名片40001(40001)：不合格（没有在 AA 绑定 QQ），不在本群提醒：跟随 ${G_LABEL} 的截止时间 ${formatDeadline(g.graceUntil!.getTime())}。`)
+        expect(messages).toContain(`👋 ${N_LABEL} 新成员 新人(50001)：不合格（没有在 AA 绑定 QQ），不在本群提醒：没有发群消息，${formatDeadline(env.clock.now + 48 * HOUR)} 移出。`)
+        expect(messages).not.toContain('提醒没有发出去')
+        // G 的名单缓存没有了（例如刚重启）：什么都不定
+        ;(env.guard as any).rosters.delete(G)
+        env.qq.groups.get(N)!.set('40003', plainMember('40003', '名片40003'))
+        await env.guard.handleNewMember(env.bot as any, N, '40003')
+        expect((await row(N, '40003'))!.graceUntil).toBeNull()
+        expect(env.qq.groupMessages(N)).toEqual([])
+        messages = (await env.adminMessages()).join('\n')
+        expect(messages).toContain(`👋 ${N_LABEL} 新成员 名片40003(40003)：不合格（没有在 AA 绑定 QQ），不在本群提醒：暂时判断不了，下一轮再定。`)
+      })
+
+      it('7. 两个群的原因不同（G 是 GROUP_ROLE_MISSING）：N 里本群计时，仍然没有消息', async () => {
+        await twoGroups(order, {
+          both: ['40001'],
+          prepare: () => env.aa.groupVerdicts.set(`${G}:40001`, { decision: 'deny', reason: 'GROUP_ROLE_MISSING', card: null }),
+        })
+        const t = env.clock.now
+        await env.guard.runReminders()
+        expect(env.qq.groupMessages(G)).toHaveLength(1)
+        expect(env.qq.groupMessages(N)).toEqual([])
+        expect((await row(N, '40001'))!.graceUntil!.getTime()).toBe(t + 48 * HOUR)
+        expect((await audits('follow', N))).toEqual([])
+        expect((await env.adminMessages()).join('\n')).toContain(`⏰ ${N_LABEL}（不在本群提醒）：没发消息、本群计时 1 人`)
+      })
+
+      for (const g of [{ mode: 'report' }, { mode: 'off' }, { mode: 'enforce', noRemind: true }] as Array<Partial<GroupModeEntry>>) {
+        it(`8. G 是 ${g.mode}${g.noRemind ? '、也勾了「不在本群提醒」' : ''}：N 里本群计时，没有消息`, async () => {
+          await twoGroups(order, { both: ['40001'], g })
+          const t = env.clock.now
+          await env.guard.runReminders()
+          expect(env.qq.groupMessages(G)).toEqual([])
+          expect(env.qq.groupMessages(N)).toEqual([])
+          expect((await row(N, '40001'))!.graceUntil!.getTime()).toBe(t + 48 * HOUR)
+        })
+      }
+
+      it('9. G 是 remind：N 里跟随·不移出（没有消息、没有截止时间、永不移出）', async () => {
+        await twoGroups(order, { both: ['40001'], g: { mode: 'remind' } })
+        for (let day = 0; day < 4; day++) {
+          await env.guard.runReminders()
+          env.clock.now += 24 * HOUR
+          await env.guard.runPatrol()
+        }
+        expect(env.qq.groupMessages(G).length).toBeGreaterThanOrEqual(4)
+        expect(env.qq.groupMessages(N)).toEqual([])
+        expect((await row(N, '40001'))!.graceUntil).toBeNull()
+        expect(env.qq.member(N, '40001')).toBeDefined()
+        expect(env.qq.actions('set_group_kick')).toEqual([])
+        expect((await env.adminMessages()).join('\n')).toContain(`⏰ ${N_LABEL}（不在本群提醒）：跟随别的群 1 人`)
+      })
+
+      it('9. 他在 G 是管理员（G 每天发管理员提醒）：N 里同样跟随·不移出', async () => {
+        await twoGroups(order, { both: ['40001'], prepare: () => { env.qq.member(G, '40001')!.role = 'admin' } })
+        for (let day = 0; day < 4; day++) {
+          await env.guard.runReminders()
+          env.clock.now += 24 * HOUR
+          await env.guard.runPatrol()
+        }
+        expect(env.qq.groupMessages(G).at(-1)!.text).toContain('以下群主/管理员')
+        expect(env.qq.groupMessages(N)).toEqual([])
+        expect((await row(N, '40001'))!.graceUntil).toBeNull()
+        expect(env.qq.member(N, '40001')).toBeDefined()
+        expect(env.qq.actions('set_group_kick')).toEqual([])
+      })
+
+      it('10. G 在冷静期、借来的截止时间已到：N 不移出，报告里有「暂不移出」；G 冷静结束、移出以后，N 跟着移出', async () => {
+        await twoGroups(order, { both: ['40001'] })
+        await env.guard.runReminders()
+        env.clock.now += 24 * HOUR
+        await env.guard.runReminders()
+        env.clock.now += 25 * HOUR // 截止时间过了，最近一次提醒在 25 小时前
+        await cool(G)
+        await env.adminMessages()
+        await env.guard.runPatrol([N])
+        expect(env.qq.member(N, '40001')).toBeDefined()
+        expect((await env.adminMessages()).join('\n')).toContain('· 1 人跟随的群在冷静期、还没提醒到或暂时判断不了，暂不移出')
+        env.clock.now += 6 * HOUR
+        await env.guard.runPatrol()
+        expect((await env.guard.store.groupState(G)).holdSince).toBeNull()
+        expect(env.qq.member(G, '40001')).toBeUndefined()
+        expect(env.qq.member(N, '40001')).toBeUndefined()
+        expect(env.qq.groupMessages(N)).toEqual([])
+      })
+
+      it('11. G 的提醒全部被 QQ 拒收：N 不借、不移出、不发消息', async () => {
+        await twoGroups(order, { both: ['40001'] })
+        env.qq.refuseSend = (_, target) => target === G
+        await env.guard.runReminders()
+        expect((await row(G, '40001'))!.graceUntil).toBeNull()
+        expect((await row(N, '40001'))!.graceUntil).toBeNull()
+        await passDeadline()
+        await env.guard.runPatrol()
+        expect(env.qq.actions('set_group_kick')).toEqual([])
+        expect(env.qq.sent.filter((m) => m.target === N)).toEqual([])
+        expect((await env.adminMessages()).join('\n')).toContain('暂不移出')
+      })
+
+      it('12. 在 AA 绑定好了（事件复查）：两个群的记录都删掉，标记都撤掉', async () => {
+        await twoGroups(order, { both: ['40001'] })
+        await env.guard.runReminders()
+        await env.guard.store.setKv(env.guard.cursorKey, 0)
+        env.aa.allow('40001', '[IGC] 甲')
+        env.aa.events.push({ id: 1, kind: 'recheck', qq: '40001' })
+        await env.guard.pollEvents()
+        expect(await row(G, '40001')).toBeUndefined()
+        expect(await row(N, '40001')).toBeUndefined()
+        expect(env.qq.member(G, '40001')!.card).toBe('[IGC] 甲')
+        expect(env.qq.member(N, '40001')!.card).toBe('[IGC] 甲')
+        expect(env.qq.groupMessages(N)).toEqual([])
+      })
+
+      it('13. 两个群都是管理员：一共只收到 G 的一条管理员提醒；只在 N 当管理员：N 里没有管理员提醒，永远没有截止时间', async () => {
+        await twoGroups(order, {
+          prepare: () => {
+            env.aa.deny(ADMIN)
+            env.qq.groups.get(N)!.set('40005', { user_id: 40005, role: 'admin', card: '副管', nickname: 'x' })
+          },
+        })
+        await env.guard.runReminders()
+        const g = env.qq.groupMessages(G)
+        expect(g).toHaveLength(1)
+        expect(g[0].ats).toEqual([ADMIN])
+        expect(g[0].text).toContain('以下群主/管理员')
+        expect(env.qq.groupMessages(N)).toEqual([])
+        await passDeadline()
+        await env.guard.runPatrol()
+        expect((await row(N, ADMIN))!.graceUntil).toBeNull()
+        expect((await row(N, '40005'))!.graceUntil).toBeNull()
+        expect(env.qq.groupMessages(N)).toEqual([])
+        expect(env.qq.actions('set_group_kick')).toEqual([])
+        expect((await env.adminMessages()).join('\n')).not.toContain(`⏰ ${N_LABEL}（不在本群提醒）`)
+      })
+
+      it('14. 每小时只能移出 1 人、两个人在两个群名单里顺序相反：同一轮两个群移出的是同一个人', async () => {
+        await twoGroups(order, {
+          both: ['40001', '40002'],
+          config: { kickPerHour: 1 },
+          prepare: () => {
+            const n = env.qq.groups.get(N)!
+            const first = n.get('40001')!
+            n.delete('40001')
+            n.set('40001', first) // N 的名单里 40002 在前
+          },
+        })
+        await env.guard.runReminders()
+        await passDeadline()
+        await env.guard.runPatrol()
+        expect(kicked(G)).toHaveLength(1)
+        expect(kicked(N)).toEqual(kicked(G))
+      })
+    })
+  }
+
+  /** 两个群都有 40001：G 在 T0、T0+24 提醒过（N 借到），然后到 T0+49：截止时间已过、最近一次提醒在 25 小时前。 */
+  async function expiredFollower(options: TwoGroups = {}) {
+    await twoGroups('GN', { both: ['40001'], ...options })
+    await env.guard.runReminders()
+    env.clock.now += 24 * HOUR
+    await env.guard.runReminders()
+    env.clock.now += 25 * HOUR
+    const n = (await row(N, '40001'))!
+    expect(n.graceUntil!.getTime()).toBeLessThan(env.clock.now)
+    expect(env.clock.now - n.lastRemindedAt!.getTime()).toBe(25 * HOUR)
+    await env.adminMessages()
+  }
+
+  describe('15. 暂不移出的几种情况', () => {
+    it('G 的新人提醒超时（G 的记录作废、没有可借值），N 记录上是已过期的旧借值：N 不移出', async () => {
+      await expiredFollower()
+      env.qq.timeoutActions.add('send_group_msg')
+      await env.guard.handleNewMember(env.bot as any, G, '40001') // 他退出 G 又回来：以前的记录作废
+      env.qq.timeoutActions.clear()
+      expect((await row(G, '40001'))!.graceUntil).toBeNull()
+      await env.guard.runPatrol([N])
+      expect(env.qq.member(N, '40001')).toBeDefined()
+      expect((await env.adminMessages()).join('\n')).toContain('· 1 人跟随的群在冷静期、还没提醒到或暂时判断不了，暂不移出')
+    })
+
+    it('G 从 remind 改回 enforce、第一次提醒之前：N 不按以前借来的截止时间移出', async () => {
+      await expiredFollower()
+      env.config.groupModes[0].mode = 'remind'
+      await env.guard.runPatrol([G])
+      expect((await row(G, '40001'))!.graceUntil).toBeNull()
+      env.config.groupModes[0].mode = 'enforce'
+      await env.guard.runPatrol([N])
+      expect(env.qq.member(N, '40001')).toBeDefined()
+      expect(env.qq.actions('set_group_kick')).toEqual([])
+    })
+
+    it('重启后 G 还没有名单缓存、G 在冷静期：N 不移出跟随的人', async () => {
+      await expiredFollower()
+      await cool(G)
+      ;(env.guard as any).rosters.delete(G)
+      await env.guard.runPatrol([N])
+      expect(env.qq.member(N, '40001')).toBeDefined()
+      expect((await env.adminMessages()).join('\n')).toContain('暂不移出')
+    })
+
+    it('G 这一轮的名单少了他（不完整）、G 的记录还在、G 在冷静期：N 不移出，每日提醒也不按本群计时刷新他', async () => {
+      await twoGroups('GN', { both: ['40001'] })
+      const now = env.clock.now
+      const n = (await row(N, '40001'))!
+      await env.guard.store.saveTracked([{ ...n, graceUntil: new Date(now - 60_000), lastRemindedAt: new Date(now - HOUR) }])
+      await cool(G)
+      ;(env.guard as any).rosters.get(G).delete('40001')
+      await env.guard.runReminders()
+      expect((await row(N, '40001'))!.lastRemindedAt!.getTime()).toBe(now - HOUR)
+      expect((await env.adminMessages()).join('\n')).toContain(`⏰ ${N_LABEL}（不在本群提醒）：暂时判断不了 1 人`)
+      await env.guard.runPatrol([N])
+      expect(env.qq.member(N, '40001')).toBeDefined()
+      expect(env.qq.groupMessages(N)).toEqual([])
+    })
+    it('G 的名单缓存里连机器人自己都没有（名单不完整）：暂时判断不了，不按本群计时', async () => {
+      await twoGroups('GN', { both: ['40001'] })
+      await cool(G)
+      ;(env.guard as any).rosters.get(G).delete(BOT)
+      await env.guard.runReminders()
+      expect((await row(N, '40001'))!.lastRemindedAt).toBeNull()
+      expect((await env.adminMessages()).join('\n')).toContain(`⏰ ${N_LABEL}（不在本群提醒）：暂时判断不了 1 人`)
+    })
+
+    it('机器人在 G 不是管理员：G 提醒不了人，N 里本群计时', async () => {
+      await twoGroups('GN', { both: ['40001'], prepare: () => { env.qq.member(G, BOT)!.role = 'member' } })
+      const t = env.clock.now
+      await env.guard.runReminders()
+      expect(env.qq.groupMessages(G)).toEqual([])
+      expect((await row(N, '40001'))!.graceUntil!.getTime()).toBe(t + 48 * HOUR)
+    })
+  })
+
+  describe('16. 暂停时不计时', () => {
+    it('N 改名片期间 aaqq.pause：本群计时的人没有提醒时间和截止时间', async () => {
+      await twoGroups('GN', { onlyN: ['40002'] })
+      env.qq.member(N, '40002')!.card = '名片40002' // 他自己把标记删了：这一轮要重新加
+      env.qq.beforeCard = (qq) => {
+        if (qq === '40002') void env.guard.setPaused(true, OPERATOR)
+      }
+      await env.guard.runReminders()
+      const n = (await row(N, '40002'))!
+      expect(n.lastRemindedAt).toBeNull()
+      expect(n.graceUntil).toBeNull()
+      expect(await audits('remind', N)).toEqual([])
+    })
+
+    it('并发的复查让 N 进入冷静期以后才轮到：同样不记', async () => {
+      await twoGroups('GN', { onlyN: ['40002'] })
+      env.qq.member(N, '40002')!.card = '名片40002'
+      let cooling: Promise<void> | null = null
+      env.qq.beforeCard = (qq) => {
+        if (qq === '40002') cooling = cool(N)
+      }
+      await env.guard.runReminders()
+      await cooling
+      const n = (await row(N, '40002'))!
+      expect(n.lastRemindedAt).toBeNull()
+      expect(n.graceUntil).toBeNull()
+    })
+  })
+
+  it('17. N 在冷静期：不移出，借来的值照样保存；冷静结束后照常移出', async () => {
+    await twoGroups('GN', { both: ['40001', '40002'] })
+    const t0 = env.clock.now
+    await env.guard.runReminders()
+    env.clock.now += 24 * HOUR
+    await env.guard.runReminders()
+    env.clock.now = t0 + 49 * HOUR // 截止时间已过
+    await cool(N)
+    env.config.breakerCount = 1 // 两个人到期，超过阈值：N 一直冷静
+    await env.guard.runReminders() // G 照常提醒；N 在冷静期，跳过
+    await env.guard.runPatrol([N])
+    expect((await env.guard.store.groupState(N)).holdSince).not.toBeNull()
+    expect((await row(N, '40001'))!.lastRemindedAt!.getTime()).toBe(t0 + 49 * HOUR)
+    expect(env.qq.member(N, '40001')).toBeDefined()
+    expect(env.qq.member(N, '40002')).toBeDefined()
+    env.config.breakerCount = 100
+    env.clock.now = t0 + 50 * HOUR
+    await env.guard.runPatrol([N])
+    expect((await env.guard.store.groupState(N)).holdSince).toBeNull()
+    expect(env.qq.member(N, '40001')).toBeUndefined()
+    expect(env.qq.member(N, '40002')).toBeUndefined()
+    expect(env.qq.groupMessages(N)).toEqual([])
+  })
+
+  it('18. N 是 remind 模式：没有消息、没有截止时间、没有 ⏰ 行，照常加标记', async () => {
+    await twoGroups('GN', { both: ['40001'], onlyN: ['40002'], n: { mode: 'remind' } })
+    await env.guard.runReminders()
+    expect(env.qq.groupMessages(G)).toHaveLength(1)
+    expect(env.qq.groupMessages(N)).toEqual([])
+    expect((await row(N, '40001'))!.graceUntil).toBeNull()
+    expect((await row(N, '40002'))!.graceUntil).toBeNull()
+    expect((await row(N, '40002'))!.lastRemindedAt).toBeNull()
+    expect(env.qq.member(N, '40002')!.card).toBe('【SPY】名片40002')
+    expect((await env.adminMessages()).join('\n')).not.toContain(`⏰ ${N_LABEL}`)
+    expect(await audits('remind', N)).toEqual([])
+  })
+
+  it('19. aaqq.status 显示「（不在本群提醒）」；report / off 模式不显示', async () => {
+    await twoGroups('GN')
+    expect(await env.guard.statusText()).toContain(`· ${N_LABEL}：enforce（提醒并移出）（不在本群提醒）`)
+    expect(await env.guard.statusText()).toContain(`· ${G_LABEL}：enforce（提醒并移出）`)
+    expect(await env.guard.statusText()).not.toContain(`${G_LABEL}：enforce（提醒并移出）（不在本群提醒）`)
+    for (const mode of ['report', 'off'] as const) {
+      env.config.groupModes[1].mode = mode
+      expect(env.guard.noRemind(N)).toBe(false)
+      expect(await env.guard.statusText()).not.toContain('（不在本群提醒）')
+    }
+  })
+})
+
+describe('0.2.7 审查修补（G1–G4）', () => {
+  const LABEL = '联盟聊天群（111111111）'
+  const people = (n: number, from = 40001) => Array.from({ length: n }, (_, i) => String(from + i))
+  const tracked = async (qq: string, groupId = GROUP) => (await env.guard.store.tracked(groupId)).get(qq)
+  const sendsTo = (groupId: string) => env.qq.actions('send_group_msg').filter((c) => String(c.params.group_id) === groupId).length
+  const BLOCKED = '；QQ 拒收了这个群的提醒（拆到单独一个人也发不出去），剩下的没有再发'
+
+  function spyWarn() {
+    const warn = vi.spyOn(env.guard.logger, 'warn')
+    return () => warn.mock.calls.map((c) => {
+      let i = 1
+      return String(c[0]).replace(/%[sd]/g, () => String(c[i++]))
+    })
+  }
+
+  /** n 个没绑定的人，设好模式并巡检一轮（加上标记、开始处置）。 */
+  async function unbound(n: number, mode: Mode, extra: Partial<GroupModeEntry> = {}) {
+    env = await setup({ breakerCount: 100, breakerPercent: 100 })
+    addMembers(...people(n))
+    env.config.groupModes = [{ groupId: GROUP, mode, ...extra }]
+    await env.guard.runPatrol()
+    await env.adminMessages()
+    env.qq.calls = []
+  }
+
+  describe('G1　QQ 全部拒收时，提醒不再一批一批拆到底', () => {
+    it('@ 群 45 人全部被拒：只有第一批拆到底（19 次），后面的人一次都不发；45 人都没有截止时间', async () => {
+      await unbound(45, 'enforce')
+      env.qq.refuseSend = (_, target) => target === GROUP
+      const logs = spyWarn()
+      await env.guard.runReminders()
+      expect(sendsTo(GROUP)).toBe(19)
+      for (const qq of people(45)) {
+        expect((await tracked(qq))!.lastRemindedAt).toBeNull()
+        expect((await tracked(qq))!.graceUntil).toBeNull()
+      }
+      expect((await env.adminMessages()).join('\n')).toContain(`⚠ ${LABEL} 提醒没有发出去（45 人），没有记提醒时间，这些人不会因此被移出${BLOCKED}`)
+      expect(logs().some((l) => l.includes('上一批拆到单独一个人也一条都没送达（QQ 可能拒收这个群的消息），剩下 35 人不再发'))).toBe(true)
+    })
+
+    it('提醒不 @ 人的群 45 人全部被拒：19 次 + 10 次（每人改写 QQ 号再试一次）= 29 次', async () => {
+      await unbound(45, 'enforce', { noAt: true })
+      env.qq.refuseSend = (_, target) => target === GROUP
+      await env.guard.runReminders()
+      expect(sendsTo(GROUP)).toBe(29)
+      expect((await env.adminMessages()).join('\n')).toContain(`提醒没有发出去（45 人）`)
+    })
+
+    it('加上不合格的管理员：管理员的提醒也不发，计入没发出去的人数', async () => {
+      env = await setup({ breakerCount: 100, breakerPercent: 100 })
+      addMembers(...people(45))
+      env.aa.deny(ADMIN)
+      setMode('enforce')
+      await env.guard.runPatrol()
+      await env.adminMessages()
+      env.qq.calls = []
+      env.qq.refuseSend = (_, target) => target === GROUP
+      await env.guard.runReminders()
+      expect(sendsTo(GROUP)).toBe(19)
+      expect((await env.adminMessages()).join('\n')).toContain(`提醒没有发出去（46 人）`)
+    })
+
+    it('离开联盟的提醒单独一个人被拒：同一群的每日提醒照常', async () => {
+      env = await setup({ breakerCount: 100, breakerPercent: 100 })
+      addMembers('40001', '40002', '40003')
+      env.aa.deny('40001', 'NO_ACCESS')
+      env.qq.refuseSend = (text, target) => target === GROUP && text.includes('@40001')
+      await enableMode('enforce')
+      await env.guard.runReminders()
+      expect((await tracked('40001'))!.graceUntil).toBeNull()
+      expect((await tracked('40002'))!.graceUntil).not.toBeNull()
+      expect((await tracked('40003'))!.graceUntil).not.toBeNull()
+      expect((await env.adminMessages()).join('\n')).not.toContain(BLOCKED)
+    })
+
+    it('LLBot 响应超时一次不算拒收：后面的批照常发', async () => {
+      await unbound(45, 'enforce')
+      const original = env.qq.handle.bind(env.qq)
+      let first = true
+      env.qq.handle = (action, params) => {
+        if (action === 'send_group_msg' && String(params.group_id) === GROUP && first) {
+          first = false
+          env.qq.calls.push({ action, params, at: Date.now() })
+          throw new OneBot.TimeoutError(params, action)
+        }
+        return original(action, params)
+      }
+      await env.guard.runReminders()
+      expect(sendsTo(GROUP)).toBe(5)
+      const reminded = []
+      for (const qq of people(45)) if ((await tracked(qq))!.graceUntil) reminded.push(qq)
+      expect(reminded).toHaveLength(35)
+      const messages = (await env.adminMessages()).join('\n')
+      expect(messages).toContain('提醒没有发出去（10 人）')
+      expect(messages).not.toContain(BLOCKED)
+    })
+
+    it('两个群：一个群全部被拒，另一个群照常', async () => {
+      env = await setup({ breakerCount: 100, breakerPercent: 100 })
+      env.aa.groups.push({ group_id: OTHER_GROUP, name: '旗舰群', kind: 'fixed' })
+      env.qq.addGroup(OTHER_GROUP, baseMembers(people(2, 50001).map((qq) => plainMember(qq, `名片${qq}`))))
+      await env.guard.refreshGroups()
+      addMembers(...people(25))
+      env.config.groupModes = [{ groupId: GROUP, mode: 'enforce' }, { groupId: OTHER_GROUP, mode: 'enforce' }]
+      await env.guard.runPatrol()
+      env.qq.calls = []
+      env.qq.refuseSend = (_, target) => target === GROUP
+      await env.guard.runReminders()
+      expect(sendsTo(GROUP)).toBe(19)
+      expect(env.qq.groupMessages(OTHER_GROUP)).toHaveLength(1)
+      expect((await tracked('50001', OTHER_GROUP))!.graceUntil).not.toBeNull()
+      expect((await tracked('50002', OTHER_GROUP))!.graceUntil).not.toBeNull()
+    })
+  })
+
+  describe('G2　提醒不 @ 人的群：单独一个名字被拒收时改写 QQ 号重发', () => {
+    async function badName(mode: Mode = 'enforce') {
+      env = await setup({ breakerCount: 100, breakerPercent: 100 })
+      env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', '坏词名字'))
+      addMembers('40002')
+      env.config.groupModes = [{ groupId: GROUP, mode, noAt: true }]
+      await env.guard.runPatrol()
+      await env.adminMessages()
+    }
+
+    it('名字被拒 → 改成 QQ 号送达：群消息里没有被拒的词，这人有截止时间，到期被移出', async () => {
+      await badName()
+      env.qq.refuseSend = (text, target) => target === GROUP && text.includes('坏词')
+      const logs = spyWarn()
+      await env.guard.runReminders()
+      const texts = env.qq.groupMessages(GROUP).map((m) => m.text).join('\n')
+      expect(texts).not.toContain('坏词')
+      expect(texts).toContain('40001（没有在 AA 绑定 QQ，截止 ')
+      expect(texts).toContain('名片40002（没有在 AA 绑定 QQ，截止 ')
+      expect((await tracked('40001'))!.graceUntil).not.toBeNull()
+      expect(logs()).toContain('群 111111111 的每日提醒里「坏词名字」被 QQ 拒收，改成只写 QQ 号重发：已送达，算提醒过')
+      expect(logs().some((l) => l.includes('其中 1 人改写成 QQ 号重发'))).toBe(true)
+      await passDeadline()
+      await env.guard.runPatrol()
+      expect(env.qq.member(GROUP, '40001')).toBeUndefined()
+    })
+
+    it('只写 QQ 号也被拒：不算提醒过，运维群 ⚠ 1 人', async () => {
+      await badName()
+      env.qq.refuseSend = (text, target) => target === GROUP && (text.includes('坏词') || text.includes('40001（'))
+      const logs = spyWarn()
+      await env.guard.runReminders()
+      expect((await tracked('40001'))!.graceUntil).toBeNull()
+      expect((await tracked('40002'))!.graceUntil).not.toBeNull()
+      expect((await env.adminMessages()).join('\n')).toContain('提醒没有发出去（1 人）')
+      expect(logs().some((l) => l.includes('被 QQ 拒收，只写 QQ 号也发不出去'))).toBe(true)
+    })
+
+    it('名字本来就是 QQ 号：不重复发', async () => {
+      env = await setup()
+      env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', '', ''))
+      env.config.groupModes = [{ groupId: GROUP, mode: 'enforce', noAt: true }]
+      await env.guard.runPatrol()
+      env.qq.calls = []
+      env.qq.refuseSend = (text, target) => target === GROUP && text.includes('40001')
+      await env.guard.runReminders()
+      expect(sendsTo(GROUP)).toBe(1)
+      expect((await tracked('40001'))!.graceUntil).toBeNull()
+    })
+
+    it('离开联盟的提醒名字被拒：同样改写 QQ 号', async () => {
+      env = await setup()
+      env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', '坏词名字'))
+      env.aa.allow('40001', '坏词名字')
+      env.config.groupModes = [{ groupId: GROUP, mode: 'enforce', noAt: true }]
+      await env.guard.runPatrol()
+      await env.guard.store.setKv(env.guard.cursorKey, 0)
+      env.qq.refuseSend = (text, target) => target === GROUP && text.includes('坏词')
+      env.aa.deny('40001', 'NO_ACCESS')
+      env.aa.events.push({ id: 1, kind: 'recheck', qq: '40001' })
+      const t = env.clock.now
+      await env.guard.pollEvents()
+      const message = env.qq.groupMessages(GROUP).at(-1)!
+      expect(message.text).toContain('40001（')
+      expect(message.text).toContain('已不再具备本群成员资格')
+      expect((await tracked('40001'))!.graceUntil!.getTime()).toBe(t + 2 * HOUR)
+    })
+
+    it('改写 QQ 号以后 LLBot 响应超时：不算提醒过', async () => {
+      await badName()
+      env.qq.refuseSend = (text, target) => target === GROUP && text.includes('坏词')
+      const original = env.qq.handle.bind(env.qq)
+      env.qq.handle = (action, params) => {
+        const text = Array.isArray(params.message) ? params.message.map((seg: any) => seg.data?.text ?? '').join('') : String(params.message)
+        if (action === 'send_group_msg' && String(params.group_id) === GROUP && text.includes('40001（')) {
+          throw new OneBot.TimeoutError(params, action)
+        }
+        return original(action, params)
+      }
+      const logs = spyWarn()
+      await env.guard.runReminders()
+      expect((await tracked('40001'))!.graceUntil).toBeNull()
+      expect((await tracked('40002'))!.graceUntil).not.toBeNull()
+      expect(logs()).toContain('群 111111111 的每日提醒里「坏词名字」被 QQ 拒收，改成只写 QQ 号重发：LLBot 响应超时，不算提醒过')
+    })
+  })
+
+  describe('G3　插件重启或巡检超时，已经移出的人照样发移出公告', () => {
+    /** n 个已到期、刚提醒过的人（enforce）。 */
+    async function dueForKick(n: number, extra: Partial<GroupModeEntry> = {}, config: Partial<Config> = {}) {
+      env = await setup({ breakerCount: 100, breakerPercent: 100, kickPerHour: 100, ...config })
+      const due = people(n)
+      const group = env.qq.groups.get(GROUP)!
+      for (const qq of due) group.set(qq, plainMember(qq, `【SPY】名片${qq}`))
+      const now = env.clock.now
+      await env.guard.store.saveTracked(due.map((qq) => ({
+        groupId: GROUP, qq, reason: 'NOT_BOUND', firstDeniedAt: new Date(now - 72 * HOUR), marked: true,
+        activeSince: new Date(now - 72 * HOUR), lastRemindedAt: new Date(now - HOUR), graceUntil: new Date(now - 60_000),
+      })))
+      env.config.groupModes = [{ groupId: GROUP, mode: 'enforce', ...extra }]
+      return due
+    }
+    const announced = () => env.qq.groupMessages(GROUP).filter((m) => m.text.includes('已被移出')).map((m) => m.text).join('\n')
+
+    it('移出第 3 个人时这一轮被中止（巡检超时）：3 个名字照样公告，日志没有「已经暂停」', async () => {
+      await dueForKick(6)
+      const logs = spyWarn()
+      env.qq.beforeKick = (qq) => {
+        if (qq === '40003') (env.guard as any).round.abort()
+      }
+      await env.guard.runPatrol()
+      expect(env.qq.actions('set_group_kick')).toHaveLength(3)
+      const text = announced()
+      for (const qq of people(3)) expect(text).toContain(`名片${qq}`)
+      expect(text).not.toContain('名片40004')
+      expect(logs().some((l) => l.includes('已经暂停'))).toBe(false)
+    })
+
+    it('移出时插件被停用（例如在控制台保存了配置）：照样公告', async () => {
+      await dueForKick(3)
+      env.qq.beforeKick = (qq) => {
+        if (qq === '40002') env.guard.dispose()
+      }
+      await env.guard.runPatrol()
+      expect(env.qq.actions('set_group_kick')).toHaveLength(2)
+      expect(announced()).toContain('名片40001、名片40002')
+    })
+
+    it('另一个实例暂停了（数据库里记着暂停，本实例没收到）：不发公告', async () => {
+      await dueForKick(3)
+      await env.guard.store.setKv('paused', true)
+      expect(env.guard.paused).toBe(false)
+      const logs = spyWarn()
+      await env.guard.runPatrol()
+      expect(env.qq.actions('set_group_kick')).toHaveLength(3)
+      expect(announced()).toBe('')
+      expect(logs().some((l) => l.includes('移出公告没有发出（已经暂停）'))).toBe(true)
+    })
+
+    it('暂停时有 25 个名字：第二批的名字也写进日志', async () => {
+      await dueForKick(25)
+      const logs = spyWarn()
+      env.qq.beforeKick = (qq) => {
+        if (qq === '40025') void env.guard.setPaused(true, OPERATOR)
+      }
+      await env.guard.runPatrol()
+      expect(env.qq.actions('set_group_kick')).toHaveLength(25)
+      expect(announced()).toBe('')
+      expect(logs()).toContain(`群 111111111 的移出公告停止发送，剩下这些名字也没公告：${people(5, 40021).map((qq) => `名片${qq}`).join('、')}`)
+    })
+
+    it('勾了「不在本群提醒」的群：巡检移出、离开联盟到期移出都不发公告，运维报告照常列出', async () => {
+      await dueForKick(2, { noRemind: true })
+      const info = vi.spyOn(env.guard.logger, 'info')
+      await env.guard.runPatrol()
+      expect(env.qq.actions('set_group_kick')).toHaveLength(2)
+      expect(env.qq.groupMessages(GROUP)).toEqual([])
+      expect(info.mock.calls.some((c) => String(c[0]).includes('设置了「不在本群提醒」，不发移出公告'))).toBe(true)
+      expect((await env.adminMessages()).join('\n')).toContain('已移出 2 人')
+      // 离开联盟到期
+      env.qq.groups.get(GROUP)!.set('40009', plainMember('40009', '【SPY】名片40009'))
+      const now = env.clock.now
+      env.aa.deny('40009', 'NO_ACCESS')
+      await env.guard.store.saveTracked([{
+        groupId: GROUP, qq: '40009', reason: 'NO_ACCESS', firstDeniedAt: new Date(now - 3 * HOUR), marked: true,
+        activeSince: new Date(now - 3 * HOUR), lastRemindedAt: new Date(now - 3 * HOUR), graceUntil: new Date(now - HOUR),
+      }])
+      await env.guard.runFastKicks()
+      expect(env.qq.member(GROUP, '40009')).toBeUndefined()
+      expect(env.qq.groupMessages(GROUP)).toEqual([])
+      expect((await env.adminMessages()).join('\n')).toContain('【离开联盟到期处理】')
+    })
+  })
+
+  describe('G4　冷静期里，机器人按验证码批准进群的新人也改名片', () => {
+    async function captchaJoin() {
+      env.aa.codes.set('7K3F9P', '40001')
+      await requestEvent('40001', '我是凯拉 QQ-7K3F9P')
+      await settle()
+      env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', ''))
+      await env.emit({ post_type: 'notice', notice_type: 'group_increase', sub_type: 'approve', group_id: +GROUP, user_id: 40001, operator_id: +BOT })
+      await settle()
+    }
+    const cool = () => env.guard.store.setGroupState(GROUP, { holdSince: new Date(env.clock.now), holdNote: '测试', holdSet: '[]' })
+
+    for (const mode of ['enforce', 'remind'] as const) {
+      it(`${mode}：冷静期里按验证码进群 → 名片改成 AA 的名片`, async () => {
+        env = await setup()
+        await enableMode(mode)
+        await cool()
+        await captchaJoin()
+        expect(env.qq.requests).toEqual([expect.objectContaining({ approve: true })])
+        expect(env.qq.member(GROUP, '40001')!.card).toBe('[IGC] 新人40001')
+      })
+    }
+
+    it('批准以后暂停了：不改', async () => {
+      env = await setup()
+      await enableMode('enforce')
+      await cool()
+      env.aa.codes.set('7K3F9P', '40001')
+      await requestEvent('40001', '我是凯拉 QQ-7K3F9P')
+      await settle()
+      await env.guard.setPaused(true, OPERATOR)
+      env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', ''))
+      await env.emit({ post_type: 'notice', notice_type: 'group_increase', sub_type: 'approve', group_id: +GROUP, user_id: 40001, operator_id: +BOT })
+      await settle()
+      expect(env.qq.member(GROUP, '40001')!.card).toBe('')
+    })
+
+    it('report 模式：不改', async () => {
+      env = await setup()
+      await enableMode('report')
+      ;(env.guard as any).approved.set(`${GROUP}:40001`, { card: '[IGC] 新人40001', at: env.clock.now })
+      env.qq.groups.get(GROUP)!.set('40001', plainMember('40001', ''))
+      await env.guard.handleNewMember(env.bot as any, GROUP, '40001')
+      expect(env.qq.member(GROUP, '40001')!.card).toBe('')
+    })
+
+    it('勾了「不在本群提醒」的群在冷静期：名片照改，群里没有消息', async () => {
+      env = await setup()
+      env.config.groupModes = [{ groupId: GROUP, mode: 'enforce', noRemind: true }]
+      await env.guard.runPatrol()
+      await cool()
+      await captchaJoin()
+      expect(env.qq.member(GROUP, '40001')!.card).toBe('[IGC] 新人40001')
+      expect(env.qq.groupMessages(GROUP)).toEqual([])
+    })
   })
 })
