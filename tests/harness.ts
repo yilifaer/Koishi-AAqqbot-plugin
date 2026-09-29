@@ -219,6 +219,8 @@ export class FakeQQ {
   timeoutActions = new Set<string>()
   /** 每次调用 set_group_card 之前调用（测试里可以在这里暂停插件）。 */
   beforeCard: ((qq: string) => void) | null = null
+  /** 每次调用 set_group_kick 之前调用（测试里可以在这里中止这一轮）。 */
+  beforeKick: ((qq: string, groupId: string) => void) | null = null
   failSend = false
   /** 只让发往这些群的消息失败。 */
   failSendGroups = new Set<string>()
@@ -268,6 +270,7 @@ export class FakeQQ {
         return m ? ok({ group_id: params.group_id, ...m }) : fail(100)
       }
       case 'set_group_kick': {
+        this.beforeKick?.(String(params.user_id), String(params.group_id))
         if (this.failKick.has(String(params.user_id)) || !group?.has(String(params.user_id))) return fail(1200)
         group.delete(String(params.user_id))
         return ok()

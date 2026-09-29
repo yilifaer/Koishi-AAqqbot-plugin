@@ -68,6 +68,17 @@ export interface PlanInput {
    * 很可能是被漏掉的老成员（DECISIONS 第 65 条）。
    */
   holdReasons?: Set<string>
+  /**
+   * 勾了「不在本群提醒」的 enforce 群（DECISIONS 第 68 条）：borrowed 是从别的群借来的截止时间和提醒时间；
+   * hold 里的人不能移出（跟随的群在冷静期、还没提醒到、那边不移出、暂时判断不了），但照样算进熔断的到期人数；
+   * nokick 是 hold 里「那边不移出，本群也不移出」的人（不算「暂不移出」）；silent 是不发消息、本群计时的人，移出时排在前面。
+   */
+  follow?: {
+    borrowed: Map<string, { graceUntil: Date; lastRemindedAt: Date; from: string }>
+    hold: Set<string>
+    nokick?: Set<string>
+    silent: Set<string>
+  }
   /** 群的总人数，用来算熔断阈值。 */
   groupSize: number
   members: Member[]
@@ -116,6 +127,10 @@ export interface Plan {
   protectedDenies: Array<{ qq: string; reason: string }>
   /** 只报告、不处置的不合格（holdReasons）。 */
   heldDenies: Array<{ qq: string; reason: string }>
+  /** 真的用借来的值改写了截止时间的人（写 follow 审计用，DECISIONS 第 68 条）。 */
+  borrowed: Array<{ qq: string; from: string }>
+  /** 因为跟随的群在冷静期、还没提醒到或暂时判断不了而暂不移出的人数（不管截止时间到没到；本群不能处置时为 0）。 */
+  followHeld: number
   reviews: Array<{ qq: string; reason: string }>
   unknowns: string[]
   /** 报告里的「新发现不合格」：上一轮还没有记录的人。 */
@@ -258,6 +273,8 @@ export function planGroup(input: PlanInput): Plan {
     denies: [],
     protectedDenies: [],
     heldDenies: [],
+    borrowed: [],
+    followHeld: 0,
     reviews: [],
     unknowns: [],
     newDenies: [],
@@ -326,13 +343,17 @@ export function planGroup(input: PlanInput): Plan {
       if (!record) plan.newDenies.push({ qq: member.qq, reason: verdict!.reason, ...staff })
       if (!record || !record.activeSince) plan.firstActions.push({ qq: member.qq, reason: verdict!.reason })
       denied.push({ member, verdict: verdict! })
-      // 可以移出：enforce、完整巡检、截止时间已到、并且最近成功提醒过（截止时间是在提醒时定下的）
-      const deadline = record?.graceUntil?.getTime()
-      const remindedAt = record?.lastRemindedAt?.getTime()
+      // 可以移出：enforce、完整巡检、截止时间已到、并且最近成功提醒过（截止时间是在提醒时定下的；
+      // 勾了「不在本群提醒」的群可以借别的群的，或者不发消息直接计时，DECISIONS 第 68 条）
+      const grace = prot ? effectiveGrace(record) : effectiveGrace(record, input.follow?.borrowed.get(member.qq))
+      const deadline = grace.graceUntil?.getTime()
+      const remindedAt = grace.lastRemindedAt?.getTime()
+      const hold = !prot && !!input.follow?.hold.has(member.qq)
+      if (hold && mode === 'enforce' && settings.allowKicks && !input.follow!.nokick?.has(member.qq)) plan.followHeld++
       if (!prot && mode === 'enforce' && settings.allowKicks && deadline !== undefined && deadline <= now) {
         const fresh = remindedAt !== undefined && now - remindedAt <= settings.remindFreshMs
         due.push({ qq: member.qq, deadline, fresh })
-        if (fresh) {
+        if (!hold && fresh) {
           const name = displayName(member.card, member.nickname, prefix) || member.qq
           kickable.push({ qq: member.qq, reason: verdict!.reason, name, deadline })
         }
@@ -420,6 +441,7 @@ export function planGroup(input: PlanInput): Plan {
   }
 
   if (!plan.writes) {
+    plan.followHeld = 0 // 本群自己不能处置（冷静中等）：不说「暂不移出」
     if (mode === 'report') planReport(input, plan)
     else planRecordOnly(input, plan, denied, held, plan.cardWrites ? { settled, syncs } : null)
     return plan
@@ -439,7 +461,9 @@ export function planGroup(input: PlanInput): Plan {
     row.activeSince = existing?.activeSince ?? new Date(now)
     // 群主 / 管理员：加标记、提醒，但永远没有截止时间、永远不移出
     const staff = isProtected(member, input.protectedIds)
-    // 截止时间只在 enforce 模式下、第一次成功发出带截止时间的提醒时定下（guard.sendReminder）
+    if (!staff) applyBorrowed(input, plan, row, existing)
+    // 截止时间只在 enforce 模式下、第一次成功发出带截止时间的提醒时定下（guard.sendReminder）；
+    // 勾了「不在本群提醒」的群可以借别的群的，或者不发消息直接计时（DECISIONS 第 68 条）
     if (mode !== 'enforce' || staff) row.graceUntil = null
     // 冷静期结束时，截止时间已过、但冷静中没有提醒过的人：重新提醒后再算宽限期（DECISIONS 第 48 条）
     if (plan.breaker === 'release' && staleDue.has(member.qq) && row.graceUntil) {
@@ -460,6 +484,9 @@ export function planGroup(input: PlanInput): Plan {
 
   planHeld(input, plan, held, marks)
   plan.cards = [...marks, ...syncs]
+  // 不发消息、本群计时的人先移出（通常是提醒群刚把他移出），两个群尽量同一批人一起走（DECISIONS 第 68 条）
+  const silent = input.follow?.silent
+  if (silent?.size) kickable.sort((a, b) => Number(silent.has(b.qq)) - Number(silent.has(a.qq)))
   const budget = Math.max(0, settings.kickBudget)
   plan.kicks = kickable.slice(0, budget).map(({ qq, reason, name }) => ({ qq, reason, name }))
   plan.kicksDeferred = kickable.length - plan.kicks.length
@@ -518,6 +545,28 @@ function planSettled(input: PlanInput, plan: Plan, settled: Member[], syncs: Car
 }
 
 /**
+ * 截止时间和提醒时间：勾了「不在本群提醒」的群，从别的群借来的提醒时间比本群记录上的更晚（或者本群没有）时用借来的（DECISIONS 第 68 条）。
+ */
+export function effectiveGrace(record: TrackedMember | undefined, borrowed?: { graceUntil: Date; lastRemindedAt: Date }):
+  { graceUntil: Date | null; lastRemindedAt: Date | null; borrowed: boolean } {
+  if (borrowed && (!record?.lastRemindedAt || borrowed.lastRemindedAt.getTime() > record.lastRemindedAt.getTime())) {
+    return { graceUntil: borrowed.graceUntil, lastRemindedAt: borrowed.lastRemindedAt, borrowed: true }
+  }
+  return { graceUntil: record?.graceUntil ?? null, lastRemindedAt: record?.lastRemindedAt ?? null, borrowed: false }
+}
+
+/** 借来的值写到这一行上（真的改写了才记进 plan.borrowed，写 follow 审计用）。 */
+function applyBorrowed(input: PlanInput, plan: Plan, row: TrackedMember, existing: TrackedMember | undefined) {
+  const borrowed = input.follow?.borrowed.get(row.qq)
+  if (!borrowed) return
+  const grace = effectiveGrace(existing, borrowed)
+  if (!grace.borrowed) return
+  row.graceUntil = grace.graceUntil
+  row.lastRemindedAt = grace.lastRemindedAt
+  plan.borrowed.push({ qq: row.qq, from: borrowed.from })
+}
+
+/**
  * 只报告、不处置的不合格（holdReasons）：记录成「只记录」行（不提醒、不移出，也不算开始处置），
  * 以前加的标记撤掉（marks 为 null 时这一轮不改名片）。
  */
@@ -565,7 +614,9 @@ function planRecordOnly(input: PlanInput, plan: Plan, denied: Array<{ member: Me
   for (const { member, verdict } of denied) {
     const existing = input.tracked.get(member.qq)
     const row = existing ? { ...existing, reason: verdict.reason } : newRecord(input.groupId, member.qq, verdict.reason, input.now)
-    if (cards) planMark(input, plan, member, row, isProtected(member, input.protectedIds), marks)
+    const staff = isProtected(member, input.protectedIds)
+    if (!staff) applyBorrowed(input, plan, row, existing)
+    if (cards) planMark(input, plan, member, row, staff, marks)
     plan.track.push(row)
   }
   if (cards) plan.cards = [...marks, ...cards.syncs]
@@ -599,7 +650,7 @@ export function planRelease(
 export function emptyPlan(): Plan {
   return {
     counts: { members: 0, allow: 0, deny: 0, review: 0, unknown: 0 },
-    denies: [], protectedDenies: [], heldDenies: [], reviews: [], unknowns: [], newDenies: [], firstActions: [],
+    denies: [], protectedDenies: [], heldDenies: [], borrowed: [], followHeld: 0, reviews: [], unknowns: [], newDenies: [], firstActions: [],
     threshold: 1, kicksDue: 0, breaker: 'none', breakerReason: '', breakerSet: [], breakerAdded: 0, regraced: 0,
     unknownHeavy: false, noRole: false, writes: false, cardWrites: false, track: [], untrack: [], cards: [], kicks: [],
     kicksDeferred: 0, cardsPending: 0, adminCardsBlocked: [], fastRemind: [],

@@ -96,7 +96,7 @@ export async function sendSplitting<T>(items: T[], send: (part: T[], label: stri
 }
 
 /** 拆开重发的结果，写日志用。 */
-export function describeSplit(report: SplitReport): string {
+export function describeSplit(report: SplitReport, hiddenText = (n: number) => `其中 ${n} 条隐藏了名字`): string {
   const how = report.halved ? `拆成 ${report.pieces} 条重发` : '只有 1 行，没法拆开'
   const outcome = report.lost || report.timedOut || report.skipped
     ? [
@@ -106,7 +106,7 @@ export function describeSplit(report: SplitReport): string {
       report.skipped ? `，${report.skipped} 条轮到时已经暂停或不能再发，没有发` : '',
     ].join('')
     : '全部送达'
-  return `被 QQ 拒收，${how}，${outcome}${report.hidden ? `；其中 ${report.hidden} 条隐藏了名字` : ''}`
+  return `被 QQ 拒收，${how}，${outcome}${report.hidden ? `；${hiddenText(report.hidden)}` : ''}`
 }
 
 // ---------------------------------------------------------------- 按行拆的文字消息（运维通知、命令回复）

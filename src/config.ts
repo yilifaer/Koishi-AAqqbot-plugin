@@ -7,6 +7,8 @@ export interface GroupModeEntry {
   mode: Mode
   /** 这个群的提醒不 @ 人，名单写成名字（DECISIONS 第 67 条）。 */
   noAt?: boolean
+  /** 这个群里不发任何提醒和移出公告，跟着别的群走或者不发消息直接计时（DECISIONS 第 68 条）。 */
+  noRemind?: boolean
 }
 
 export interface Config {
@@ -94,8 +96,9 @@ export const Config: Schema<Config> = Schema.intersect([
       groupId: Schema.string().required().description('群号'),
       mode: modeSchema.default('report').description('模式'),
       noAt: Schema.boolean().default(false).description('提醒不 @ 人'),
+      noRemind: Schema.boolean().default(false).description('不在本群提醒'),
     })).role('table').default([])
-      .description('单独设置某些群的模式。改了以后下一轮巡检（保存配置后约 20 秒）就生效；一下子要开始处置的人太多时会先进入冷静期（见「防误踢」）。降级立即生效。勾上「提醒不 @ 人」的群，所有提醒照常发、照样算提醒过（enforce 照常移出），只是名单写成名字、不 @。'),
+      .description('单独设置某些群的模式。改了以后下一轮巡检（保存配置后约 20 秒）就生效；一下子要开始处置的人太多时会先进入冷静期（见「防误踢」）。降级立即生效。勾上「提醒不 @ 人」的群，所有提醒照常发、照样算提醒过（enforce 照常移出），只是名单写成名字、不 @。勾上「不在本群提醒」的群：群里不发任何提醒和移出公告。在别的受管群被提醒的人，跟着那个群走（那个群的截止时间到了才从本群移出，那个群不移出他本群也不移出）；别的群都不会提醒的人，不提醒、默默计时，到期直接移出（名片照常加标记）。只在 remind / enforce 模式下起作用。'),
   }).description('群模式'),
 
   Schema.object({
@@ -123,7 +126,7 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     graceHours: Schema.natural().min(1).max(720).default(48)
-      .description('enforce 模式下的宽限期：从第一次收到带截止时间的 @ 提醒开始算，过了时间还不合格才移出。移出前 36 小时内一定成功提醒过这个人。'),
+      .description('enforce 模式下的宽限期：从第一次收到带截止时间的 @ 提醒开始算，过了时间还不合格才移出。移出前 36 小时内一定成功提醒过这个人。勾了「不在本群提醒」的群除外（见「单独设置」）。'),
     remindTime: Schema.string().pattern(/^\s*([01]?\d|2[0-3]):[0-5]\d\s*$/).default('19:30')
       .description('每天几点在群里 @ 提醒不合格的人（机器人电脑的本地时间，格式 `19:30`）。'),
     remindTemplate: Schema.string().role('textarea').default('以下成员还没有满足本群的要求，请尽快在联盟 AA 完成 QQ 绑定：{url}\n{list}')
@@ -131,13 +134,13 @@ export const Config: Schema<Config> = Schema.intersect([
     warnTemplate: Schema.string().role('textarea').default('以下成员还没有满足本群的要求，请在截止时间前在联盟 AA 完成 QQ 绑定，否则会被移出本群：{url}\n{list}')
       .description('enforce 模式的提醒文字。`{list}` 里会带上每个人的截止时间。'),
     markAdmins: Schema.boolean().default(true)
-      .description('不合格的群主、管理员也加标记，并在每日提醒时单独 @ 他们（remind / enforce 模式）。他们**永远不会被移出**。关掉后，下一轮巡检撤掉他们身上的标记。白名单里的人不受影响。'),
+      .description('不合格的群主、管理员也加标记，并在每日提醒时单独 @ 他们（remind / enforce 模式）。他们**永远不会被移出**。关掉后，下一轮巡检撤掉他们身上的标记。白名单里的人不受影响。勾了「不在本群提醒」的群不发提醒（见「单独设置」）。'),
     adminRemindTemplate: Schema.string().role('textarea').default('以下群主/管理员还没有满足本群的要求（不会被移出），请尽快在联盟 AA 处理：{url}\n{list}')
       .description('提醒不合格的群主、管理员时用的文字（没有截止时间）。`{list}` 是被 @ 的人和原因，`{url}` 是绑定网址。'),
     fastReasons: Schema.array(Schema.string()).role('table').default(['NO_ACCESS', 'USER_INACTIVE'])
-      .description('「离开联盟」类原因：AA 判成这些原因的人不等每日提醒，一发现就 @ 提醒；enforce 模式下过了下面的时间就移出，不等巡检。填 AA 的原因码（`NO_ACCESS` 没有成员资格、`USER_INACTIVE` 账号已停用）。群主、管理员、白名单不受影响；因为人太多进过冷静期的那一批照旧按每日提醒和上面的宽限期处理。'),
+      .description('「离开联盟」类原因：AA 判成这些原因的人不等每日提醒，一发现就 @ 提醒；enforce 模式下过了下面的时间就移出，不等巡检。填 AA 的原因码（`NO_ACCESS` 没有成员资格、`USER_INACTIVE` 账号已停用）。群主、管理员、白名单不受影响；因为人太多进过冷静期的那一批照旧按每日提醒和上面的宽限期处理。勾了「不在本群提醒」的群除外（见「单独设置」）。'),
     fastGraceHours: Schema.natural().min(1).max(48).default(2)
-      .description('「离开联盟」类原因的宽限时间（小时）：从被 @ 提醒开始算，到点就移出（enforce 模式）。注意：在联盟里换军团、中途待在 NPC 军团的人，AA 也会判成没有成员资格，过了这个时间同样会被移出（不拉黑，可以重新申请）。'),
+      .description('「离开联盟」类原因的宽限时间（小时）：从被 @ 提醒开始算，到点就移出（enforce 模式）。注意：在联盟里换军团、中途待在 NPC 军团的人，AA 也会判成没有成员资格，过了这个时间同样会被移出（不拉黑，可以重新申请）。勾了「不在本群提醒」的群除外（见「单独设置」）。'),
     fastTemplate: Schema.string().role('textarea').default('{list}\n你在联盟 AA 上已不再具备本群成员资格，将在截止时间被移出本群。如有误会请尽快联系管理员。')
       .description('「离开联盟」类原因的提醒文字（enforce 模式；remind 模式用上面的 remind 提醒文字）。`{list}` 是被 @ 的人、原因和截止时间，`{url}` 是绑定网址。'),
     markCards: Schema.boolean().default(true)
@@ -145,7 +148,7 @@ export const Config: Schema<Config> = Schema.intersect([
     markPrefix: Schema.string().default('【SPY】')
       .description('名片标记，例如 `【SPY】`，会加在原名片前面。'),
     kickAnnounce: Schema.boolean().default(true)
-      .description('enforce 模式移出成员后，在该群里也发一条公告。'),
+      .description('enforce 模式移出成员后，在该群里也发一条公告。勾了「不在本群提醒」的群除外（见「单独设置」）。'),
     kickAnnounceTemplate: Schema.string().role('textarea').default('以下成员因未满足本群的要求已被移出：{list}\n完成联盟 AA 绑定后可以重新申请入群：{url}')
       .description('移出公告。`{list}` 是被移出的人的名片。'),
   }).description('宽限、提醒与标记'),
