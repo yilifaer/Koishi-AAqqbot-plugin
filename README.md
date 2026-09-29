@@ -239,7 +239,7 @@ npm run build     # 编译到 lib/
 
 接口契约见 aa-qqbot 仓库的 `API.md`；设计决定见本仓库的 [`DECISIONS.md`](DECISIONS.md)。
 
-发布：改动先通过 Pull Request 合并到 main，然后在 GitHub 的 Actions 页面运行 **Publish to npm**（npm 受信任发布，见 [`DECISIONS.md`](DECISIONS.md) 第 36 条）。
+发布：改动先通过 Pull Request 合并到 main，然后在 GitHub 的 Actions 页面运行 **Publish to npm**（只用 npm 受信任发布，不需要令牌，见 [`DECISIONS.md`](DECISIONS.md) 第 36 条）。运行时勾选「只检查受信任发布」可以只确认 npm 那边设置好了，不会发布。
 
 ## 许可证
 

@@ -1,20 +1,51 @@
 # 发布到 npm。在 GitHub 网页上：Actions → Publish to npm → Run workflow。
 # 发布的版本号取自 package.json 的 version；这个版本已经发布过时会失败（npm 不允许重复发布）。
 #
-# 身份验证（二选一）：
-# - 受信任发布（推荐，不需要令牌）：在 npmjs.com 的包设置里把本仓库的 publish.yml 设为 Trusted Publisher。
-# - 令牌：在仓库 Settings → Secrets and variables → Actions 里添加 NPM_TOKEN。
+# 身份验证只用 npm 的「受信任发布」（Trusted Publisher，不需要令牌）：在 npmjs.com 的包设置里，
+# 把 GitHub 用户 yilifaer、仓库 Koishi-AAqqbot-plugin、工作流 publish.yml 设为 Trusted Publisher。
+# 设好以后可以勾选「只检查受信任发布」运行一次：只确认 npm 认不认这个工作流，不会发布任何东西。
 name: Publish to npm
 
 on:
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: 只检查受信任发布有没有设置好（不发布）
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  check:
+    if: ${{ inputs.check_only }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查 npm 受信任发布（不发布）
+        run: |
+          ID_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org" | jq -r '.value // empty')
+          if [ -z "$ID_TOKEN" ]; then
+            echo "::error::拿不到 GitHub 的身份令牌（工作流需要 id-token: write 权限）"
+            exit 1
+          fi
+          echo "::add-mask::$ID_TOKEN"
+          CODE=$(curl -sS -o exchange.json -w '%{http_code}' -X POST -H "Authorization: Bearer $ID_TOKEN" \
+            https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/koishi-plugin-aaqqbot)
+          TOKEN=$(jq -r '.token // empty' exchange.json 2>/dev/null)
+          if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
+          MESSAGE=$(jq -r '.message // .error // empty' exchange.json 2>/dev/null)
+          rm -f exchange.json
+          if [ "${CODE:0:1}" = 2 ] && [ -n "$TOKEN" ]; then
+            echo "✅ 受信任发布已经设置好：npm 认可这个仓库的 publish.yml，以后发布不需要令牌"
+          else
+            echo "::error::受信任发布还没设置好（HTTP $CODE）：$MESSAGE"
+            exit 1
+          fi
+
   publish:
+    if: ${{ !inputs.check_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,9 +68,8 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: 升级 npm（受信任发布需要 npm 11.5.1 以上）
         run: npm install -g npm@latest
+      # 只用受信任发布：npm 用 GitHub 的身份令牌换一个一次性的发布凭证，不需要 NPM_TOKEN
       - run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: 打上版本标签
         run: |
           git tag "v$VERSION"
