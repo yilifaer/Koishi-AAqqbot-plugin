@@ -297,6 +297,11 @@ export class Guard {
     return isMode(this.config.defaultMode) ? this.config.defaultMode : 'report'
   }
 
+  /** 这个群的提醒不 @ 人（「单独设置」里勾了「提醒不 @ 人」，DECISIONS 第 67 条）。 */
+  noAt(groupId: string): boolean {
+    return (this.config.groupModes ?? []).some((entry) => normalizeId(entry.groupId) === groupId && !!entry.noAt)
+  }
+
   modeInfo(groupId: string, state: GroupState): ModeInfo {
     return { effective: this.desiredMode(groupId), cooling: state.holdSince !== null }
   }
@@ -1736,8 +1741,16 @@ export class Guard {
       const deadline = !graceUntil ? '' : graceUntil.getTime() <= now ? '，已过截止时间，下一次处理时会被移出' : `，截止 ${formatDeadline(graceUntil.getTime())}`
       return `（${reasonShort(row.reason)}${deadline}）\n`
     }
+    // 不 @ 人的群：名单写成名字（没有名字就写 QQ 号），照样算提醒过（DECISIONS 第 67 条）
+    const noAt = this.noAt(groupId)
+    const roster = this.rosters.get(groupId)
+    const nameOf = (qq: string) => {
+      const member = roster?.get(qq)
+      return (member && displayName(member.card, member.nickname, this.config.markPrefix ?? '')) || qq
+    }
+    const whoLength = (qq: string) => (noAt ? charLength(nameOf(qq)) : AT_CHARS)
     const estimate = (part: TrackedMember[]) => charLength(head) + charLength(tail)
-      + part.reduce((sum, row) => sum + AT_CHARS + charLength(entryText(row, this.now())), 0)
+      + part.reduce((sum, row) => sum + whoLength(row.qq) + charLength(entryText(row, this.now())), 0)
     // 每批最多 20 人；一条消息估算超过约 800 字就再对半拆（名单分短，DECISIONS 第 62 条）
     const queue = chunk(rows, REMIND_CHUNK)
     const batches: TrackedMember[][] = []
@@ -1768,7 +1781,7 @@ export class Guard {
           const now = this.now()
           updated = part.map((row) => ({ ...row, graceUntil: deadlineFor(row, now), lastRemindedAt: new Date(now) }))
           const content: Fragment[] = [h.text(head)]
-          for (const row of updated) content.push(h.at(row.qq), h.text(entryText(row, now)))
+          for (const row of updated) content.push(noAt ? h.text(nameOf(row.qq)) : h.at(row.qq), h.text(entryText(row, now)))
           if (tail) content.push(h.text(tail))
           return content as any
         }
